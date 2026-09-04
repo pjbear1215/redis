@@ -29,6 +29,37 @@
  * jemalloc size class (270 -> 320, as before). */
 #define REFINERY_BLK_PREFIX 8
 
+/* Bytes a managed block needs to hold `s` COMPACTLY: the prefix, the sds
+ * header, the string and its NUL -- and nothing else.
+ *
+ * Copying the source sds *allocation* instead (sdsAllocSize) is what the first
+ * version did, and it cost a whole jemalloc size class. sdsnewlen() asks for
+ * hdr+len+1 = 262 B for a 256 B value, jemalloc gives it the 320 B class, and
+ * sds records alloc = 320-5-1 = 314; sdsAllocSize then reports 320, so the
+ * block asked for 8+320 = 328 and landed in the 384 B class. Every managed
+ * value was 20 % larger than the stock one it replaced -- 960 MB on the 15 M
+ * key E2 dataset -- and, worse for the measurement, it spread the same objects
+ * over 20 % more pages than the baseline arm they are compared against.
+ *
+ * Rebuilding the sds compactly (alloc == len) puts 8+5+256+1 = 270 back in the
+ * 320 B class, i.e. exactly the stock footprint. sdsavail() is then 0, which
+ * is correct: a managed value never grows in place -- APPEND and SETRANGE
+ * unguard to a zmalloc'd copy first. */
+static inline size_t refineryCompactSize(sds s, size_t *hdrlen_out) {
+    size_t hdrlen = (size_t)((char *)s - (char *)sdsAllocPtr(s));
+    if (hdrlen_out) *hdrlen_out = hdrlen;
+    return REFINERY_BLK_PREFIX + hdrlen + sdslen(s) + 1;
+}
+
+/* Write `s` into `blk` compactly and publish the offset of its payload. */
+static inline void refineryWriteBlock(char *blk, sds s, size_t hdrlen) {
+    size_t len = sdslen(s);
+    *(uint64_t *)blk = (uint64_t)(REFINERY_BLK_PREFIX + hdrlen);
+    memcpy(blk + REFINERY_BLK_PREFIX, (char *)s - hdrlen, hdrlen);
+    memcpy(blk + REFINERY_BLK_PREFIX + hdrlen, s, len + 1);
+    sdssetalloc((sds)(blk + REFINERY_BLK_PREFIX + hdrlen), len);
+}
+
 static inline sds refinerySdsFromBlock(uint64_t base) {
     char *b = (char *)(uintptr_t)base;
     return (sds)(b + *(uint64_t *)b);
@@ -58,20 +89,19 @@ void refineryValueAdopt(robj *o) {
     if (o->refcount >= OBJ_FIRST_SPECIAL_REFCOUNT) return;
 
     sds s = o->ptr;
-    char *ohdr = (char *)sdsAllocPtr(s);
-    size_t osz = sdsAllocSize(s);            /* header + alloc + NUL */
-    size_t hdrlen = (size_t)((char *)s - ohdr);
+    size_t hdrlen;
+    size_t need = refineryCompactSize(s, &hdrlen);
+    size_t osz = need - REFINERY_BLK_PREFIX;
 
-    char *blk = refinery_alloc(REFINERY_BLK_PREFIX + osz);
+    char *blk = refinery_alloc(need);
     if (blk == NULL) return;                 /* stay unmanaged; never fail a write */
-    *(uint64_t *)blk = (uint64_t)(REFINERY_BLK_PREFIX + hdrlen);
-    memcpy(blk + REFINERY_BLK_PREFIX, ohdr, osz);
+    refineryWriteBlock(blk, s, hdrlen);
     /* Refinery (Branch A), D12: this memcpy IS the value write once the runtime
      * is on -- the write the network layer already logged went into the
      * transient zmalloc'd sds this copies out of, which is freed immediately.
      * Without this record the M1 numerator would lose the payload term
      * entirely and the managed heaps would read as pure waste. */
-    refineryTagPages(blk, REFINERY_BLK_PREFIX + osz, REFINERY_C_VALUE_MANAGED);
+    refineryTagPages(blk, need, REFINERY_C_VALUE_MANAGED);
     refineryLogWrite(blk + REFINERY_BLK_PREFIX, osz, REFINERY_W_VALUE_NEW);
 
     sdsfree(s);
@@ -154,13 +184,13 @@ void refineryValueAdoptOver(robj *val, robj *old) {
         val->refcount < OBJ_FIRST_SPECIAL_REFCOUNT)
     {
         sds ns = val->ptr;
-        char *ohdr = (char *)sdsAllocPtr(ns);
-        size_t osz = sdsAllocSize(ns);
+        size_t nhdr;
+        size_t need = refineryCompactSize(ns, &nhdr);
         char *blk = (char *)(uintptr_t)refinery_guide_deref_write(&old->ptr);
-        if (blk && refinery_block_size(blk) >= REFINERY_BLK_PREFIX + osz) {
-            *(uint64_t *)blk = (uint64_t)(REFINERY_BLK_PREFIX + (size_t)((char *)ns - ohdr));
-            memcpy(blk + REFINERY_BLK_PREFIX, ohdr, osz);
-            refineryLogWrite(blk + REFINERY_BLK_PREFIX, osz, REFINERY_W_VALUE_INPLACE);
+        if (blk && refinery_block_size(blk) >= need) {
+            refineryWriteBlock(blk, ns, nhdr);
+            refineryLogWrite(blk + REFINERY_BLK_PREFIX, need - REFINERY_BLK_PREFIX,
+                             REFINERY_W_VALUE_INPLACE);
             sdsfree(ns);
             refinery_disown(&old->ptr);
             old->encoding = OBJ_ENCODING_RAW;
@@ -212,17 +242,17 @@ robj *refineryValueOverwriteInPlace(robj *val, robj *old) {
     if (val->refcount >= OBJ_FIRST_SPECIAL_REFCOUNT) return NULL;
 
     sds ns = val->ptr;
-    char *nhdr = (char *)sdsAllocPtr(ns);
-    size_t nsz = sdsAllocSize(ns);
+    size_t nhdr;
+    size_t need = refineryCompactSize(ns, &nhdr);
     /* deref_write, not deref: this IS the write, and it is what puts the
      * object in WRITE_HEAP (A1). */
     char *blk = (char *)(uintptr_t)refinery_guide_deref_write(&old->ptr);
-    if (blk == NULL || refinery_block_size(blk) < REFINERY_BLK_PREFIX + nsz)
+    if (blk == NULL || refinery_block_size(blk) < need)
         return NULL;
 
-    *(uint64_t *)blk = (uint64_t)(REFINERY_BLK_PREFIX + (size_t)(ns - nhdr));
-    memcpy(blk + REFINERY_BLK_PREFIX, nhdr, nsz);
-    refineryLogWrite(blk + REFINERY_BLK_PREFIX, nsz, REFINERY_W_VALUE_INPLACE);
+    refineryWriteBlock(blk, ns, nhdr);
+    refineryLogWrite(blk + REFINERY_BLK_PREFIX, need - REFINERY_BLK_PREFIX,
+                     REFINERY_W_VALUE_INPLACE);
     return old;
 }
 
