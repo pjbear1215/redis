@@ -272,6 +272,16 @@ extern "C" void refinery_scope_reset(void)
         refinery_scope_exit();
 }
 
+extern "C" void refinery_exit(int code)
+{
+    if (refinery_on)
+    {
+        fflush(nullptr);
+        _exit(code);
+    }
+    exit(code);
+}
+
 /* ---- smaps sampling (E13) ---------------------------------------------- */
 
 extern "C" void refinery_smaps_sample(const char *label)

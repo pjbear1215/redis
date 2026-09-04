@@ -1306,7 +1306,7 @@ void shutdownCommand(client *c) {
      * and the collector is waiting in signalMigrationBegin() for this
      * thread's still-open command scope. Closing it first is what makes
      * a clean SHUTDOWN terminate instead of hanging after 'bye bye'. */
-    if (prepareForShutdown(flags) == C_OK) { refinery_scope_reset(); exit(0); }
+    if (prepareForShutdown(flags) == C_OK) { refinery_scope_reset(); refinery_exit(0); }
     /* If we're here, then shutdown is ongoing (the client is still blocked) or
      * failed (the client has received an error). */
 }

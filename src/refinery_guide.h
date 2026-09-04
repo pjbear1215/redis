@@ -133,6 +133,15 @@ void refinery_scope_exit(void);
  * signalMigrationBegin() for that scope to be observed -- a deadlock that
  * leaves the server hung after "Redis is now ready to exit, bye bye". */
 void refinery_scope_reset(void);
+/* Terminate. With the runtime on this is _exit(), because the OBASE
+ * ObjectCollector's migrator thread is a `while (true)` loop with no stop
+ * condition and ~ObjectCollector joins it unconditionally
+ * (crest/runtime/ObjectCollector.cc:70,171) -- so a process that constructed
+ * the collector can never run its static destructors. Everything durable has
+ * already happened in prepareForShutdown()/finishShutdown(): the RDB is
+ * written, fsynced and renamed, the AOF is closed, the pidfile is unlinked.
+ * With the runtime off this is a plain exit(), i.e. stock behaviour. */
+void refinery_exit(int code);
 
 /* ---- fork ------------------------------------------------------------ */
 /* Parent, immediately before fork(): publish the fork intent and wait for any
