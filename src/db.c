@@ -288,8 +288,10 @@ static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEnt
     dictSetVal(db->dict, de, val);
     refineryLogWrite((char*)de + sizeof(void*), sizeof(void*),
                      REFINERY_W_DICT_VAL);
-    refineryValueAdoptWritten(val); /* Refinery, D12 install point #2:
-                                    * an overwrite IS the write (F2). */
+    refineryValueAdoptOver(val, old); /* Refinery, D12 install point #2: an
+                                      * overwrite IS the write (F2), and it
+                                      * reuses the old block so the write lands
+                                      * where stock Redis's would. */
 
     if (server.lazyfree_lazy_server_del) {
         freeObjAsync(key,old,db->id);

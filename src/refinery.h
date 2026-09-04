@@ -45,6 +45,10 @@
 #define REFINERY_C_DICT_ENTRY  0x08
 #define REFINERY_C_DICT_TABLE  0x10
 #define REFINERY_C_OTHER       0x20
+/* Refinery (Branch A), D12: a value payload living in a block the OBASE
+ * runtime manages. Distinct from VALUE_SDS, which is the transient zmalloc'd
+ * sds the network layer builds and refineryValueAdopt() copies out of. */
+#define REFINERY_C_VALUE_MANAGED 0x40
 
 #ifndef REFINERY_WRITELOG
 #define REFINERY_WRITELOG 1

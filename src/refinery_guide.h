@@ -86,6 +86,15 @@ void refinery_install(void **slot, void *p);
 /* Unregister `slot` and free the block it points at into its own arena.
  * Leaves the slot zeroed. */
 void refinery_release(void **slot);
+/* Unregister `slot` WITHOUT freeing the block: ownership has moved to another
+ * slot. Used by the same-size overwrite path, which reuses the previous value's
+ * block instead of allocating a new one. */
+void refinery_disown(void **slot);
+/* Usable size of a managed block (jem_sallocx). */
+size_t refinery_block_size(const void *p);
+/* 1 unless REFINERY_REDIS_REUSE=0: reuse the previous value's block on a
+ * same-size overwrite (see refineryValueAdoptOver in refinery_obj.c). */
+extern int refinery_reuse_blocks;
 
 /* ---- scopes ---------------------------------------------------------- */
 /* One pair per command (server.c call()) and one per cron pass. Nesting is

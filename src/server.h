@@ -949,6 +949,7 @@ sds refineryValueSdsW(robj *o);
 sds refineryValueSdsRO(robj *o);
 void refineryValueAdopt(robj *o);
 void refineryValueAdoptWritten(robj *o);
+void refineryValueAdoptOver(robj *val, robj *old);
 void refineryValueReadopt(robj *o);
 void refineryValueUnguard(robj *o);
 void refineryValueRelease(robj *o);

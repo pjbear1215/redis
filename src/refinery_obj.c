@@ -66,6 +66,13 @@ void refineryValueAdopt(robj *o) {
     if (blk == NULL) return;                 /* stay unmanaged; never fail a write */
     *(uint64_t *)blk = (uint64_t)(REFINERY_BLK_PREFIX + hdrlen);
     memcpy(blk + REFINERY_BLK_PREFIX, ohdr, osz);
+    /* Refinery (Branch A), D12: this memcpy IS the value write once the runtime
+     * is on -- the write the network layer already logged went into the
+     * transient zmalloc'd sds this copies out of, which is freed immediately.
+     * Without this record the M1 numerator would lose the payload term
+     * entirely and the managed heaps would read as pure waste. */
+    refineryTagPages(blk, REFINERY_BLK_PREFIX + osz, REFINERY_C_VALUE_MANAGED);
+    refineryLogWrite(blk + REFINERY_BLK_PREFIX, osz, REFINERY_W_VALUE_NEW);
 
     sdsfree(s);
     o->ptr = NULL;                           /* the word must be clean metadata */
@@ -116,6 +123,56 @@ void refineryValueRelease(robj *o) {
 void refineryValueAdoptWritten(robj *o) {
     refineryValueAdopt(o);
     if (objIsGuided(o)) refinery_mark_write(&o->ptr);
+}
+
+/* Overwrite of an existing key: reuse the previous value's managed block when
+ * it is big enough.
+ *
+ * This is what keeps the integration faithful to F2 (DESIGN.md 0). Stock Redis
+ * SET is alloc-new-then-free and the freed 320 B region is handed straight back
+ * to the next SET, so a steady SET stream writes onto pages that were already
+ * resident -- and therefore shared -- at fork time. Allocating a fresh block per
+ * overwrite instead would quietly convert Redis into an alloc-new system whose
+ * value writes never land on shared pages, which would make the COW measurement
+ * a measurement of the allocator change rather than of the placement policy.
+ * Reusing the block reproduces the original behaviour inside the managed heap,
+ * and it is also what gives the write axis something to classify: the block
+ * keeps its identity, its guide word and its WRITE bit across overwrites.
+ *
+ * Only safe when the old value is unshared (refcount 1): dbSetValue() frees it
+ * immediately afterwards, but another holder (slowlog, a Lua argv cache entry)
+ * would be left reading a block that now belongs to the new value. The old slot
+ * is disowned BEFORE the new one is installed, so at no instant do two
+ * registered guide slots point at the same block.
+ *
+ * REFINERY_REDIS_REUSE=0 turns it off, which is the alloc-new contrast arm.
+ */
+void refineryValueAdoptOver(robj *val, robj *old) {
+    if (refinery_on && refinery_reuse_blocks && old != NULL && old != val &&
+        old->refcount == 1 && objIsGuided(old) &&
+        val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_RAW &&
+        val->refcount < OBJ_FIRST_SPECIAL_REFCOUNT)
+    {
+        sds ns = val->ptr;
+        char *ohdr = (char *)sdsAllocPtr(ns);
+        size_t osz = sdsAllocSize(ns);
+        char *blk = (char *)(uintptr_t)refinery_guide_deref_write(&old->ptr);
+        if (blk && refinery_block_size(blk) >= REFINERY_BLK_PREFIX + osz) {
+            *(uint64_t *)blk = (uint64_t)(REFINERY_BLK_PREFIX + (size_t)((char *)ns - ohdr));
+            memcpy(blk + REFINERY_BLK_PREFIX, ohdr, osz);
+            refineryLogWrite(blk + REFINERY_BLK_PREFIX, osz, REFINERY_W_VALUE_INPLACE);
+            sdsfree(ns);
+            refinery_disown(&old->ptr);
+            old->encoding = OBJ_ENCODING_RAW;
+            old->ptr = NULL;
+            val->ptr = NULL;
+            refinery_install(&val->ptr, blk);
+            val->encoding = OBJ_ENCODING_RAW_GUIDED;
+            refinery_mark_write(&val->ptr);
+            return;
+        }
+    }
+    refineryValueAdoptWritten(val);
 }
 
 /* Re-adopt after an in-place mutation (APPEND, SETRANGE): the mutation itself

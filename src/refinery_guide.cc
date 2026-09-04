@@ -34,6 +34,7 @@ void addToTAG(ActiveScopeGuard *guard, void *varPtr);
 }
 
 int refinery_on = 0;
+int refinery_reuse_blocks = 1;
 
 static Sama *g_refinery_sama = nullptr;
 static ObjectCollector *g_refinery_oc = nullptr;
@@ -93,6 +94,10 @@ extern "C" int refinery_boot(void)
     if (!refinery_on)
         return 0;
     refineryInitFromEnv();
+    {
+        const char *r = getenv("REFINERY_REDIS_REUSE");
+        refinery_reuse_blocks = (r && *r == '0') ? 0 : 1;
+    }
     return 1;
 }
 
@@ -191,6 +196,18 @@ extern "C" void refinery_release(void **slot)
     *reinterpret_cast<uintptr_t *>(slot) = 0;
 }
 
+extern "C" void refinery_disown(void **slot)
+{
+    Guide<void> *g = reinterpret_cast<Guide<void> *>(slot);
+    soda_.Set0(((uint64_t)&g->ptr - (uint64_t)global_addr_start) / 8);
+    *reinterpret_cast<uintptr_t *>(slot) = 0;
+}
+
+extern "C" size_t refinery_block_size(const void *p)
+{
+    return p ? jem_sallocx(const_cast<void *>(p), 0) : 0;
+}
+
 /* ---- scopes ------------------------------------------------------------ */
 
 extern "C" void refinery_scope_enter(void)
@@ -227,10 +244,7 @@ extern "C" void refinery_fork_begin(void)
      * child is reaped).
      */
     g_fork_in_flight.store(true, std::memory_order_seq_cst);
-    g_snapshot_child_alive.store(true, std::memory_order_seq_cst);
     refineryNoteSnapshot(); /* opens the fork window (A2) + arms the CIW credit */
-    if (g_refinery_parent_ro_while_child)
-        g_parent_ro_active.store(true, std::memory_order_seq_cst);
     g_forks.fetch_add(1, std::memory_order_relaxed);
 
     long start = nowMs();
@@ -241,6 +255,15 @@ extern "C" void refinery_fork_begin(void)
         struct timespec ts = {0, 2000000};
         nanosleep(&ts, nullptr);
     }
+    /*
+     * Only now, with no round in flight and fork_in_flight published, does a
+     * child count as alive. Raising it before the wait made the collector's
+     * end-of-round I2 check fire for a round the fork was correctly waiting
+     * out -- a false positive on a counter whose whole job is to be zero.
+     */
+    g_snapshot_child_alive.store(true, std::memory_order_seq_cst);
+    if (g_refinery_parent_ro_while_child)
+        g_parent_ro_active.store(true, std::memory_order_seq_cst);
 }
 
 extern "C" void refinery_fork_child(void)
