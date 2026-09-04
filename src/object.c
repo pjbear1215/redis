@@ -83,7 +83,16 @@ robj *makeObjectShared(robj *o) {
 /* Create a string object with encoding OBJ_ENCODING_RAW, that is a plain
  * string object where o->ptr points to a proper sds string. */
 robj *createRawStringObject(const char *ptr, size_t len) {
-    return createObject(OBJ_STRING, sdsnewlen(ptr,len));
+    robj *o = createObject(OBJ_STRING, sdsnewlen(ptr,len));
+    /* Refinery (Branch A): at >44 B every stored string value is RAW, so
+     * this is where a value's robj (16 B, size class 16) and its sds
+     * (5+len+1 B) are allocated and filled. Both are labelled here; the
+     * payload write is the M1 numerator's dominant term. */
+    refineryTagPages(o, sizeof(robj), REFINERY_C_VALUE_ROBJ);
+    refineryTagPages(o->ptr, sdsAllocSize(o->ptr), REFINERY_C_VALUE_SDS);
+    refineryLogWrite(o, sizeof(robj), REFINERY_W_ROBJ_NEW);
+    refineryLogWrite(o->ptr, len, REFINERY_W_VALUE_NEW);
+    return o;
 }
 
 /* Create a string object with encoding OBJ_ENCODING_EMBSTR, that is

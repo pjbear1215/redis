@@ -79,6 +79,7 @@ typedef long long ustime_t; /* microsecond time type. */
                            N-elements flat arrays */
 #include "rax.h"     /* Radix tree */
 #include "connection.h" /* Connection abstraction */
+#include "refinery.h"   /* Refinery (Branch A): M1 instrumentation */
 
 #define REDISMODULE_CORE 1
 typedef struct redisObject robj;

@@ -117,12 +117,18 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
         if (server.current_client && server.current_client->flags & CLIENT_NO_TOUCH &&
             server.current_client->cmd->proc != touchCommand)
             flags |= LOOKUP_NOTOUCH;
-        if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH)){
+        if ((!hasActiveChildProcess() || refinery_lru_always) &&
+            !(flags & LOOKUP_NOTOUCH)){
             if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
                 updateLFU(val);
             } else {
                 val->lru = LRU_CLOCK();
             }
+            /* Refinery (Branch A): a GET writes the first 4 bytes of the
+             * robj (type:4 encoding:4 lru:24). Redis suppresses this while a
+             * saving child is alive; REFINERY_LRU_IN_CHILD=1 restores it as
+             * the control arm. */
+            refineryLogWrite(val, 4, REFINERY_W_ROBJ_LRU);
         }
 
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
@@ -199,8 +205,17 @@ static void dbAddInternal(redisDb *db, robj *key, robj *val, int update_if_exist
     }
     serverAssertWithInfo(NULL, key, de != NULL);
     dictSetKey(db->dict, de, sdsdup(key->ptr));
+    /* Refinery (Branch A): classify and log the insert. */
+    refineryTagPages(de, 3*sizeof(void*), REFINERY_C_DICT_ENTRY);
+    refineryTagPages(dictGetKey(de), sdsAllocSize(dictGetKey(de)),
+                     REFINERY_C_KEY_SDS);
+    refineryLogWrite(de, 3*sizeof(void*), REFINERY_W_DICT_ENTRY);
+    refineryLogWrite(dictGetKey(de), sdsAllocSize(dictGetKey(de)),
+                     REFINERY_W_KEY_SDS);
     initObjectLRUOrLFU(val);
     dictSetVal(db->dict, de, val);
+    refineryLogWrite((char*)de + sizeof(void*), sizeof(void*),
+                     REFINERY_W_DICT_VAL);
     signalKeyAsReady(db, key, val->type);
     if (server.cluster_enabled) slotToKeyAddEntry(de, db);
     notifyKeyspaceEvent(NOTIFY_NEW,"new",key,db->id);
@@ -248,6 +263,7 @@ static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEnt
     robj *old = dictGetVal(de);
 
     val->lru = old->lru;
+    refineryLogWrite(val, 4, REFINERY_W_ROBJ_LRU);
 
     if (overwrite) {
         /* RM_StringDMA may call dbUnshareStringValue which may free val, so we
@@ -264,6 +280,8 @@ static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEnt
         old = dictGetVal(de);
     }
     dictSetVal(db->dict, de, val);
+    refineryLogWrite((char*)de + sizeof(void*), sizeof(void*),
+                     REFINERY_W_DICT_VAL);
 
     if (server.lazyfree_lazy_server_del) {
         freeObjAsync(key,old,db->id);

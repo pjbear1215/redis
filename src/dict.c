@@ -46,6 +46,7 @@
 #include "dict.h"
 #include "zmalloc.h"
 #include "redisassert.h"
+#include "refinery.h"
 
 /* Using dictEnableResize() / dictDisableResize() we make possible to disable
  * resizing and rehashing of the hash table as needed. This is very important
@@ -251,6 +252,11 @@ int _dictExpand(dict *d, unsigned long size, int* malloc_failed)
             return DICT_ERR;
     } else
         new_ht_table = zcalloc(newsize*sizeof(dictEntry*));
+
+    /* Refinery (Branch A): the bucket array is the only dict allocation big
+     * enough to own whole pages; label it so a copied page can be named. */
+    refineryTagPages(new_ht_table, newsize*sizeof(dictEntry*),
+                     REFINERY_C_DICT_TABLE);
 
     new_ht_used = 0;
 

@@ -1158,6 +1158,10 @@ void checkChildrenDone(void) {
     pid_t pid;
 
     if ((pid = waitpid(-1, &statloc, WNOHANG)) != 0) {
+        /* Refinery (Branch A): close the write-log window the instant the
+         * child is reaped, so the M1 numerator covers the child's lifetime
+         * and not the traffic that follows it. */
+        refineryMarkChildEnd();
         int exitcode = WIFEXITED(statloc) ? WEXITSTATUS(statloc) : -1;
         int bysignal = 0;
 
@@ -6607,6 +6611,9 @@ int redisFork(int purpose) {
 
     int childpid;
     long long start = ustime();
+    /* Refinery (Branch A): the write log measures exactly the child's
+     * lifetime, so the window starts here, in the parent, before fork(). */
+    refineryLogReset();
     if ((childpid = fork()) == 0) {
         /* Child.
          *
@@ -6616,6 +6623,7 @@ int redisFork(int purpose) {
          * memory resources are low.
          */
         server.in_fork_child = purpose;
+        refineryEnterChild(); /* Refinery (Branch A): child ring from here. */
         setupChildSignalHandlers();
         setOOMScoreAdj(CONFIG_OOM_BGCHILD);
         updateDictResizePolicy();
@@ -7093,6 +7101,7 @@ int main(int argc, char **argv) {
 #endif
     tzset(); /* Populates 'timezone' global. */
     zmalloc_set_oom_handler(redisOutOfMemoryHandler);
+    refineryInit(); /* Refinery (Branch A): before any keyspace allocation. */
 
     /* To achieve entropy, in case of containers, their time() and getpid() can
      * be the same. But value of tv_usec is fast enough to make the difference */

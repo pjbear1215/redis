@@ -491,6 +491,8 @@ void setrangeCommand(client *c) {
     if (sdslen(value) > 0) {
         o->ptr = sdsgrowzero(o->ptr,offset+sdslen(value));
         memcpy((char*)o->ptr+offset,value,sdslen(value));
+        refineryLogWrite((char*)o->ptr+offset, sdslen(value),
+                         REFINERY_W_VALUE_INPLACE);
         signalModifiedKey(c,c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_STRING,
             "setrange",c->argv[1],c->db->id);
@@ -717,7 +719,10 @@ void appendCommand(client *c) {
 
         /* Append the value */
         o = dbUnshareStringValue(c->db,c->argv[1],o);
+        size_t refinery_oldlen = sdslen(o->ptr);
         o->ptr = sdscatlen(o->ptr,append->ptr,sdslen(append->ptr));
+        refineryLogWrite((char*)o->ptr+refinery_oldlen,
+                         sdslen(append->ptr), REFINERY_W_VALUE_INPLACE);
         totlen = sdslen(o->ptr);
     }
     signalModifiedKey(c,c->db,c->argv[1]);

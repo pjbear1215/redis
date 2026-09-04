@@ -498,6 +498,21 @@ void debugCommand(client *c) {
 NULL
         };
         addReplyHelp(c, help);
+    } else if (!strcasecmp(c->argv[1]->ptr,"refinery")) {
+        /* Refinery (Branch A): DEBUG REFINERY RESET|DUMP <dir>|REGION */
+        char refinery_buf[512];
+        if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"reset")) {
+            refineryLogReset();
+            addReply(c,shared.ok);
+        } else if (c->argc == 4 && !strcasecmp(c->argv[2]->ptr,"dump")) {
+            if (refineryDump(c->argv[3]->ptr) == 0) addReply(c,shared.ok);
+            else addReplyError(c,"refinery dump failed");
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"region")) {
+            refineryStatus(refinery_buf,sizeof(refinery_buf));
+            addReplyBulkCString(c,refinery_buf);
+        } else {
+            addReplyError(c,"DEBUG REFINERY RESET|DUMP <dir>|REGION");
+        }
     } else if (!strcasecmp(c->argv[1]->ptr,"segfault")) {
         /* Compiler gives warnings about writing to a random address
          * e.g "*((char*)-1) = 'x';". As a workaround, we map a read-only area
