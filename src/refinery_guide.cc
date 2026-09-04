@@ -66,6 +66,28 @@ static std::atomic<uint64_t> g_forks{0};
  * and the longest wait a fork that did proceed actually served out. */
 static std::atomic<uint64_t> g_fork_wait_timeouts{0};
 static std::atomic<uint64_t> g_fork_wait_ms_max{0};
+/*
+ * I2, measured over exactly the child's life rather than inferred from a flag.
+ * The four placement counters are snapshotted at the instant
+ * g_snapshot_child_alive goes up and compared when it comes down; anything that
+ * moved in between is an object the collector relocated under a live snapshot.
+ * Both hooks run on the main Redis thread and the snapshot is only armed on the
+ * success path, so no lock is needed. It assumes one checkpoint child at a time
+ * -- true for RDB and AOF rewrite, which are mutually exclusive; a concurrent
+ * CHILD_TYPE_LDB would interleave the brackets, and Redis does not use one here.
+ */
+static uint64_t g_plc_at_fork[4] = {0, 0, 0, 0};
+static bool g_plc_armed = false;
+static std::atomic<uint64_t> g_placement_moved_under_child{0};
+static std::atomic<uint64_t> g_placement_delta_under_child{0};
+
+static void placementSnapshot(uint64_t out[4])
+{
+    out[0] = g_stat_promoted_hot.load(std::memory_order_relaxed);
+    out[1] = g_stat_promoted_write.load(std::memory_order_relaxed);
+    out[2] = g_stat_evicted_write_to_hot.load(std::memory_order_relaxed);
+    out[3] = g_stat_demoted_cold.load(std::memory_order_relaxed);
+}
 /* Live bytes in managed blocks, counted at the jemalloc boundary (sallocx of
  * what refinery_alloc handed out, minus sallocx of what refinery_release
  * frees). refinery_disown() moves ownership between slots and must not move
@@ -400,6 +422,8 @@ extern "C" int refinery_fork_begin(void)
      * end-of-round I2 check fire for a round the fork was correctly waiting
      * out -- a false positive on a counter whose whole job is to be zero.
      */
+    placementSnapshot(g_plc_at_fork);
+    g_plc_armed = true;
     g_snapshot_child_alive.store(true, std::memory_order_seq_cst);
     if (g_refinery_parent_ro_while_child)
         g_parent_ro_active.store(true, std::memory_order_seq_cst);
@@ -419,6 +443,20 @@ extern "C" void refinery_fork_end(void)
 {
     if (!refinery_on)
         return;
+    if (g_plc_armed)
+    {
+        uint64_t now4[4];
+        placementSnapshot(now4);
+        uint64_t moved = 0;
+        for (int i = 0; i < 4; i++)
+            moved += now4[i] - g_plc_at_fork[i];
+        if (moved != 0)
+        {
+            g_placement_moved_under_child.fetch_add(1, std::memory_order_relaxed);
+            g_placement_delta_under_child.fetch_add(moved, std::memory_order_relaxed);
+        }
+        g_plc_armed = false;
+    }
     g_parent_ro_active.store(false, std::memory_order_seq_cst);
     g_snapshot_child_alive.store(false, std::memory_order_seq_cst);
     g_fork_in_flight.store(false, std::memory_order_seq_cst);
@@ -564,6 +602,8 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
              "refinery_oc_rounds_run:%llu\r\n"
              "refinery_oc_rounds_skipped_fork:%llu\r\n"
              "refinery_oc_round_started_with_child:%llu\r\n"
+             "refinery_placement_moved_under_child:%llu\r\n"
+             "refinery_placement_delta_under_child:%llu\r\n"
              "refinery_parent_ro_cas_suppressed:%llu\r\n",
              (unsigned long long)g_stat_promoted_hot.load(),
              (unsigned long long)g_stat_promoted_write.load(),
@@ -574,6 +614,8 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
              (unsigned long long)g_stat_oc_rounds_run.load(),
              (unsigned long long)g_stat_oc_rounds_skipped_fork.load(),
              (unsigned long long)g_stat_oc_round_started_with_child.load(),
+             (unsigned long long)g_placement_moved_under_child.load(),
+             (unsigned long long)g_placement_delta_under_child.load(),
              (unsigned long long)g_stat_parent_ro_cas_suppressed.load());
     out += line;
 
