@@ -275,6 +275,29 @@ static robj *dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEn
     serverAssertWithInfo(NULL,key,de != NULL);
     robj *old = dictGetVal(de);
 
+    /* Refinery (Branch A), D12 step 6 (B2): keep the old robj and write the new
+     * bytes into its managed block. Nothing below this point runs when it takes
+     * over: the dict entry, the robj header and old->refcount are all left
+     * untouched, which is the whole point.
+     *
+     * It has to be tried BEFORE the `overwrite` block, not after. That block
+     * models a SET over an existing key as unlink+add and brackets the module
+     * callback with incrRefCount(old)/decrRefCount(old) -- two 4-byte stores
+     * into the OLD value's robj, at a scattered address, on every SET. They are
+     * not in the write log and the parent-side guide-word suppression cannot
+     * reach them, and with identity reuse in place they were measured to be the
+     * last thing still dirtying the robj array (write-robj-ro: 39,986 pages at
+     * 0.00 % recorded write utilization).
+     *
+     * Skipping the unlink notification here is the correct semantics, not a
+     * shortcut: with identity reuse the key really is updated rather than
+     * unlinked and re-added, and dbReplaceValue() -- overwrite = 0 -- already
+     * models exactly that and skips the same two callbacks. */
+    if (allow_reuse) {
+        robj *kept = refineryValueOverwriteInPlace(val, old);
+        if (kept) return kept;
+    }
+
     if (overwrite) {
         /* RM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain old */
@@ -288,16 +311,6 @@ static robj *dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEn
         decrRefCount(old);
         /* Because of RM_StringDMA, old may be changed, so we need get old again */
         old = dictGetVal(de);
-    }
-
-    /* Refinery (Branch A), D12 step 6 (B2): keep the old robj and write the
-     * new bytes into its managed block. Placed after the overwrite block so
-     * that `old` is the object the module callbacks left behind. When it takes
-     * over, the dict entry and the robj header are not written at all -- the
-     * whole point -- and neither object is freed. */
-    if (allow_reuse) {
-        robj *kept = refineryValueOverwriteInPlace(val, old);
-        if (kept) return kept;
     }
 
     /* B1 (REFINERY_LRU_COPY=0): the 4 B recency stamp copied into the new
