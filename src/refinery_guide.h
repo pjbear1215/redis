@@ -145,8 +145,18 @@ void refinery_exit(int code);
 
 /* ---- fork ------------------------------------------------------------ */
 /* Parent, immediately before fork(): publish the fork intent and wait for any
- * migration round already in flight (I1). Opens the fork window (A2). */
-void refinery_fork_begin(void);
+ * migration round already in flight (I1). Opens the fork window (A2).
+ *
+ * Returns 0 if the caller may fork, -1 if the wait exceeded
+ * REFINERY_FORK_WAIT_MAX_S (default 120) -- in which case the caller must NOT
+ * fork, and the intent this call published has been retracted. Forking into a
+ * live round lets migration move objects out from under a snapshot child,
+ * which is exactly what I1 forbids: a deferred checkpoint is a service
+ * degradation, a checkpoint taken across a migration is a correctness
+ * failure. Always returns 0 when the runtime is off. */
+int refinery_fork_begin(void);
+/* REFINERY_FORK_WAIT_MAX_S, for the log line on the refusal path. */
+unsigned refinery_fork_wait_max(void);
 /* Child, immediately after fork(): read-only dereference from here on (I3). */
 void refinery_fork_child(void);
 /* Parent, when the child is reaped: close the window. */

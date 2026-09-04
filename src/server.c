@@ -6646,7 +6646,19 @@ int redisFork(int purpose) {
     /* Refinery (Branch A), D12 / plan-a.md 4.3 I1: quiesce the object
      * collector and open the fork window before fork(). Placed in redisFork()
      * so RDB, AOF rewrite and diskless replication are covered by one edit. */
-    refinery_fork_begin();
+    if (refinery_fork_begin() != 0) {
+        /* I1: a collector round outran REFINERY_FORK_WAIT_MAX_S. Never fork
+         * into a live round -- fail the fork instead. The caller reports this
+         * the way it reports any fork failure (rdb_last_bgsave_status:err for
+         * a BGSAVE) and retries on its own schedule. */
+        if (isMutuallyExclusiveChildType(purpose)) closeChildInfoPipe();
+        serverLog(LL_WARNING,
+            "Refinery: fork refused (I1) -- a migration round was still in "
+            "flight after %u s. The checkpoint will be retried.",
+            refinery_fork_wait_max());
+        errno = EAGAIN;
+        return -1;
+    }
     /* Refinery (Branch A), D12 step 6 (E13): the parent's own per-VMA
      * AnonHugePages, at the two moments the huge-page story is decided.
      * Taken here rather than by the driver so "fork+0" is exact -- an

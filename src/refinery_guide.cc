@@ -40,6 +40,9 @@ int refinery_on = 0;
 int refinery_reuse_blocks = 1;
 int refinery_robj_reuse = 0;
 int refinery_lru_copy = 1;
+/* I1: how long refinery_fork_begin() may wait for a collector round before it
+ * gives up and fails the fork. REFINERY_FORK_WAIT_MAX_S, seconds. */
+static unsigned refinery_fork_wait_max_s = 120;
 
 static Sama *g_refinery_sama = nullptr;
 static ObjectCollector *g_refinery_oc = nullptr;
@@ -59,6 +62,10 @@ static std::atomic<uint64_t> g_values_released{0};
 static std::atomic<uint64_t> g_adopt_bytes{0};
 static std::atomic<uint64_t> g_release_bytes{0};
 static std::atomic<uint64_t> g_forks{0};
+/* I1 instrumentation: forks refused because a collector round outran the cap,
+ * and the longest wait a fork that did proceed actually served out. */
+static std::atomic<uint64_t> g_fork_wait_timeouts{0};
+static std::atomic<uint64_t> g_fork_wait_ms_max{0};
 /* Live bytes in managed blocks, counted at the jemalloc boundary (sallocx of
  * what refinery_alloc handed out, minus sallocx of what refinery_release
  * frees). refinery_disown() moves ownership between slots and must not move
@@ -117,6 +124,7 @@ extern "C" int refinery_boot(void)
         refinery_reuse_blocks = (r && *r == '0') ? 0 : 1;
         const char *o = getenv("REFINERY_REDIS_ROBJ_REUSE");
         refinery_robj_reuse = (o && *o == '1' && refinery_reuse_blocks) ? 1 : 0;
+        refinery_fork_wait_max_s = envUInt("REFINERY_FORK_WAIT_MAX_S", 120);
     }
     return 1;
 }
@@ -326,10 +334,15 @@ extern "C" void refinery_smaps_sample(const char *label)
 
 /* ---- fork -------------------------------------------------------------- */
 
-extern "C" void refinery_fork_begin(void)
+extern "C" unsigned refinery_fork_wait_max(void)
+{
+    return refinery_fork_wait_max_s;
+}
+
+extern "C" int refinery_fork_begin(void)
 {
     if (!refinery_on)
-        return;
+        return 0;
     /*
      * I1: publish the fork intent, then wait for a migration round that is
      * already running. The collector publishes round_active before it reads
@@ -341,16 +354,46 @@ extern "C" void refinery_fork_begin(void)
      */
     g_fork_in_flight.store(true, std::memory_order_seq_cst);
     refineryNoteSnapshot(); /* opens the fork window (A2) + arms the CIW credit */
-    g_forks.fetch_add(1, std::memory_order_relaxed);
 
+    /*
+     * D12 step 7. The wait used to give up after 60 s and fork anyway ("never
+     * block the server forever; I1 is then not provable"). Step 6's E13 run
+     * caught what that costs: at 15 M objects a collector round outran the
+     * cap, the fork landed on a live round, and both collector arms recorded
+     * oc_round_started_with_child = 1 *with* real migration during the child's
+     * life -- I1 violated, and the two arms had to be discarded. A silent
+     * proceed turns a correctness invariant into a timing accident, so the cap
+     * now FAILS the fork: redisFork() returns -1, rdbSaveBackground() sets
+     * rdb_last_bgsave_status:err, and serverCron retries on its own schedule.
+     * The refusal is transient by construction -- the round the fork is
+     * waiting out is ended by the collector itself.
+     */
     long start = nowMs();
+    long cap_ms = (long)refinery_fork_wait_max_s * 1000L;
     while (g_oc_round_active.load(std::memory_order_seq_cst))
     {
-        if (nowMs() - start > 60000)
-            break; /* never block the server forever; I1 is then not provable */
+        if (nowMs() - start > cap_ms)
+        {
+            /* Retract the intent. Leaving it set would make the collector skip
+             * every round from here on (it reads this flag at round start).
+             * The fork window is a timestamp that lapses on its own
+             * (refineryInForkWindow), so nothing else has to be undone. */
+            g_fork_in_flight.store(false, std::memory_order_seq_cst);
+            g_fork_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+            return -1;
+        }
         struct timespec ts = {0, 2000000};
         nanosleep(&ts, nullptr);
     }
+    {
+        uint64_t waited = (uint64_t)(nowMs() - start);
+        uint64_t prev = g_fork_wait_ms_max.load(std::memory_order_relaxed);
+        while (waited > prev &&
+               !g_fork_wait_ms_max.compare_exchange_weak(
+                   prev, waited, std::memory_order_relaxed))
+            ;
+    }
+    g_forks.fetch_add(1, std::memory_order_relaxed);
     /*
      * Only now, with no round in flight and fork_in_flight published, does a
      * child count as alive. Raising it before the wait made the collector's
@@ -360,6 +403,7 @@ extern "C" void refinery_fork_begin(void)
     g_snapshot_child_alive.store(true, std::memory_order_seq_cst);
     if (g_refinery_parent_ro_while_child)
         g_parent_ro_active.store(true, std::memory_order_seq_cst);
+    return 0;
 }
 
 extern "C" void refinery_fork_child(void)
@@ -421,6 +465,7 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
              "refinery_parent_ro_while_child:%d\r\n"
              "refinery_write_epoch_k:%u\r\n"
              "refinery_fork_window_s:%u\r\n"
+             "refinery_fork_wait_max_s:%u\r\n"
              "refinery_reuse_blocks:%d\r\n"
              "refinery_robj_reuse:%d\r\n"
              "refinery_lru_copy:%d\r\n",
@@ -429,6 +474,7 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
              g_refinery_obase_hints ? 1 : 0,
              g_refinery_parent_ro_while_child ? 1 : 0,
              g_refinery_write_epoch_k, g_refinery_fork_window_s,
+             refinery_fork_wait_max_s,
              refinery_reuse_blocks, refinery_robj_reuse, refinery_lru_copy);
     out += line;
 
@@ -496,12 +542,16 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
              "refinery_values_released:%llu\r\n"
              "refinery_adopt_bytes:%llu\r\n"
              "refinery_release_bytes:%llu\r\n"
-             "refinery_forks:%llu\r\n",
+             "refinery_forks:%llu\r\n"
+             "refinery_fork_wait_timeouts:%llu\r\n"
+             "refinery_fork_wait_ms_max:%llu\r\n",
              (unsigned long long)g_values_adopted.load(),
              (unsigned long long)g_values_released.load(),
              (unsigned long long)g_adopt_bytes.load(),
              (unsigned long long)g_release_bytes.load(),
-             (unsigned long long)g_forks.load());
+             (unsigned long long)g_forks.load(),
+             (unsigned long long)g_fork_wait_timeouts.load(),
+             (unsigned long long)g_fork_wait_ms_max.load());
     out += line;
 
     snprintf(line, sizeof(line),
