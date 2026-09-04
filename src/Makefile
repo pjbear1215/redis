@@ -274,6 +274,31 @@ ifeq ($(MALLOC),jemalloc)
 	FINAL_LIBS := ../deps/jemalloc/lib/libjemalloc.a $(FINAL_LIBS)
 endif
 
+# --- Refinery (Branch A), D12: link the OBASE runtime into redis-server -----
+#
+# librefinery.a is built out of code/obase (`make librefinery DS=ds_none`) with
+# clang++-12; it needs a jemalloc whose PUBLIC prefix is jem_ *and* whose
+# PRIVATE namespace is not the default je_, or its ~890 internal symbols
+# collide with the bundled jemalloc Redis links for its own zmalloc. That
+# second build lives in $(JEMALLOC_OBASE) -- see
+# experiments/branch-a/redis/build-jemalloc-obase.sh. Both allocators are
+# resident on purpose: Redis's je_ heap holds keys, dict entries and the
+# bucket array, OBASE's jem_ heap holds the managed values.
+#
+# The runtime is ALWAYS linked in; REFINERY=1 in the environment is what turns
+# it on. A redis-server started without it must behave exactly as stock, which
+# is the step-1 acceptance test.
+OBASE_DIR?=../../obase
+JEMALLOC_OBASE?=/build/jwpark/jemalloc-obase
+REFINERY_CXX?=clang++-12
+REFINERY_LIB=$(OBASE_DIR)/crest/bin/librefinery.a
+REFINERY_CXXFLAGS=-std=c++17 -O2 -march=native -g -fPIC -pthread \
+	-I$(OBASE_DIR)/crest -I$(OBASE_DIR)/crest/runtime \
+	-I$(OBASE_DIR)/crest/datastructures -I$(JEMALLOC_OBASE)/include \
+	-DCREST_DS=ds_none -DREFINERY_WRITELOG
+REFINERY_OBJ=refinery_guide.o
+FINAL_LIBS+= $(REFINERY_LIB) $(JEMALLOC_OBASE)/lib/libjemalloc.a -lstdc++ -pthread
+
 # LIBSSL & LIBCRYPTO
 LIBSSL_LIBS=
 LIBSSL_PKGCONFIG := $(shell $(PKG_CONFIG) --exists libssl && echo $$?)
@@ -348,7 +373,7 @@ endif
 
 REDIS_SERVER_NAME=redis-server$(PROG_SUFFIX)
 REDIS_SENTINEL_NAME=redis-sentinel$(PROG_SUFFIX)
-REDIS_SERVER_OBJ=refinery.o adlist.o quicklist.o ae.o anet.o dict.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o crc16.o endianconv.o slowlog.o eval.o bio.o rio.o rand.o memtest.o syscheck.o crcspeed.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o acl.o tracking.o socket.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o resp_parser.o call_reply.o script_lua.o script.o functions.o function_lua.o commands.o strl.o connection.o unix.o logreqres.o
+REDIS_SERVER_OBJ=refinery.o refinery_obj.o adlist.o quicklist.o ae.o anet.o dict.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o crc16.o endianconv.o slowlog.o eval.o bio.o rio.o rand.o memtest.o syscheck.o crcspeed.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o acl.o tracking.o socket.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o resp_parser.o call_reply.o script_lua.o script.o functions.o function_lua.o commands.o strl.o connection.o unix.o logreqres.o
 REDIS_CLI_NAME=redis-cli$(PROG_SUFFIX)
 REDIS_CLI_OBJ=refinery.o anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o
 REDIS_BENCHMARK_NAME=redis-benchmark$(PROG_SUFFIX)
@@ -402,7 +427,7 @@ ifneq ($(strip $(PREV_FINAL_LDFLAGS)), $(strip $(FINAL_LDFLAGS)))
 endif
 
 # redis-server
-$(REDIS_SERVER_NAME): $(REDIS_SERVER_OBJ)
+$(REDIS_SERVER_NAME): $(REDIS_SERVER_OBJ) $(REFINERY_OBJ)
 	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/lua/src/liblua.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a $(FINAL_LIBS)
 
 # redis-sentinel
@@ -435,6 +460,9 @@ DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ
 # Because the jemalloc.h header is generated as a part of the jemalloc build,
 # building it should complete before building any other object. Instead of
 # depending on a single artifact, build all dependencies first.
+refinery_guide.o: refinery_guide.cc refinery_guide.h .make-prerequisites
+	$(QUIET_CC)$(REFINERY_CXX) $(REFINERY_CXXFLAGS) -c refinery_guide.cc -o $@
+
 %.o: %.c .make-prerequisites
 	$(REDIS_CC) -MMD -o $@ -c $<
 

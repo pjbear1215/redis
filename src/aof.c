@@ -1784,8 +1784,9 @@ int rioWriteBulkObject(rio *r, robj *obj) {
      * in a child process when this function is called). */
     if (obj->encoding == OBJ_ENCODING_INT) {
         return rioWriteBulkLongLong(r,(long)obj->ptr);
-    } else if (sdsEncodedObject(obj)) {
-        return rioWriteBulkString(r,obj->ptr,sdslen(obj->ptr));
+    } else if (sdsEncodedObject(obj) || objIsGuided(obj)) {
+        sds as = objSds(obj); /* Refinery (Branch A), D12 */
+        return rioWriteBulkString(r,as,sdslen(as));
     } else {
         serverPanic("Unknown string encoding");
     }

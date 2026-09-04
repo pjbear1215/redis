@@ -497,8 +497,13 @@ ssize_t rdbSaveStringObject(rio *rdb, robj *obj) {
     if (obj->encoding == OBJ_ENCODING_INT) {
         return rdbSaveLongLongAsStringObject(rdb,(long)obj->ptr);
     } else {
-        serverAssertWithInfo(NULL,obj,sdsEncodedObject(obj));
-        return rdbSaveRawString(rdb,obj->ptr,sdslen(obj->ptr));
+        /* Refinery (Branch A), D12: in an RDB child every dereference is the
+         * read-only path (tl_snapshot_child), so this does not dirty a guide
+         * word -- invariant I3, and the reason the child needs no special
+         * casing of its own. */
+        serverAssertWithInfo(NULL,obj,sdsEncodedObject(obj) || objIsGuided(obj));
+        sds rs = objSds(obj);
+        return rdbSaveRawString(rdb,(unsigned char*)rs,sdslen(rs));
     }
 }
 

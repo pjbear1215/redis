@@ -1162,6 +1162,7 @@ void checkChildrenDone(void) {
          * child is reaped, so the M1 numerator covers the child's lifetime
          * and not the traffic that follows it. */
         refineryMarkChildEnd();
+        refinery_fork_end(); /* Refinery (Branch A), D12: the child is reaped. */
         int exitcode = WIFEXITED(statloc) ? WEXITSTATUS(statloc) : -1;
         int bysignal = 0;
 
@@ -1379,7 +1380,13 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     clientsCron();
 
     /* Handle background operations on Redis databases. */
+    /* Refinery (Branch A), D12: active expiry and resize run outside call(),
+     * and active expiry frees values, so the cron pass needs a scope of its
+     * own. It must not span a fork: refinery_fork_begin() waits for the
+     * collector, whose signalMigrationBegin() waits for open scopes. */
+    refinery_scope_enter();
     databasesCron();
+    refinery_scope_exit();
 
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. */
@@ -3479,6 +3486,14 @@ int incrCommandStatsOnError(struct redisCommand *cmd, int flags) {
  */
 void call(client *c, int flags) {
     long long dirty;
+    /* Refinery (Branch A), D12 / DESIGN.md e.5: one ActiveScopeGuard per
+     * command. Every guided dereference inside pins its object for the
+     * duration of the command, which is what stops the collector freeing a
+     * value under a memcpy. The scope must stay short: the collector's
+     * signalMigrationBegin() waits for every thread with an open scope to
+     * observe the new migration generation, and that only happens on a
+     * level-0 scope entry. Nested call()s (EXEC, Lua, modules) are counted. */
+    refinery_scope_enter();
     uint64_t client_old_flags = c->flags;
     struct redisCommand *real_cmd = c->realcmd;
     client *prev_client = server.executing_client;
@@ -3704,6 +3719,7 @@ void call(client *c, int flags) {
     }
 
     server.executing_client = prev_client;
+    refinery_scope_exit();
 }
 
 /* Used when a command that is ready for execution needs to be rejected, due to
@@ -6240,6 +6256,15 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
         }
     }
 
+    /* Refinery (Branch A), D12. Not in the default section list: INFO
+     * refinery / INFO everything only, so no existing output changes. */
+    if (everything || (dictFind(section_dict,"refinery") != NULL)) {
+        char refbuf[4096];
+        refinery_info(refbuf, sizeof(refbuf));
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Refinery\r\n%s", refbuf);
+    }
+
     /* Get info from modules.
      * Returned when the user asked for "everything", "modules", or a specific module section.
      * We're not aware of the module section names here, and we rather avoid the search when we can.
@@ -6614,6 +6639,10 @@ int redisFork(int purpose) {
     /* Refinery (Branch A): the write log measures exactly the child's
      * lifetime, so the window starts here, in the parent, before fork(). */
     refineryLogReset();
+    /* Refinery (Branch A), D12 / plan-a.md 4.3 I1: quiesce the object
+     * collector and open the fork window before fork(). Placed in redisFork()
+     * so RDB, AOF rewrite and diskless replication are covered by one edit. */
+    refinery_fork_begin();
     if ((childpid = fork()) == 0) {
         /* Child.
          *
@@ -6624,6 +6653,7 @@ int redisFork(int purpose) {
          */
         server.in_fork_child = purpose;
         refineryEnterChild(); /* Refinery (Branch A): child ring from here. */
+        refinery_fork_child(); /* I3: read-only dereference from here on. */
         setupChildSignalHandlers();
         setOOMScoreAdj(CONFIG_OOM_BGCHILD);
         updateDictResizePolicy();
@@ -6638,6 +6668,7 @@ int redisFork(int purpose) {
         if (childpid == -1) {
             int fork_errno = errno;
             if (isMutuallyExclusiveChildType(purpose)) closeChildInfoPipe();
+            refinery_fork_end(); /* Refinery: no child, close the window. */
             errno = fork_errno;
             return -1;
         }
@@ -7102,6 +7133,7 @@ int main(int argc, char **argv) {
     tzset(); /* Populates 'timezone' global. */
     zmalloc_set_oom_handler(redisOutOfMemoryHandler);
     refineryInit(); /* Refinery (Branch A): before any keyspace allocation. */
+    refinery_boot(); /* Refinery (Branch A), D12: read REFINERY* from the env. */
 
     /* To achieve entropy, in case of containers, their time() and getpid() can
      * be the same. But value of tv_usec is fast enough to make the difference */
@@ -7332,6 +7364,24 @@ int main(int argc, char **argv) {
         clusterInitListeners();
     }
     InitServerLast();
+
+    /* Refinery (Branch A), D12. Two Redis features relocate or asynchronously
+     * free a value behind the runtime's back and would corrupt a managed one:
+     * active defrag rewrites robj->ptr from the cron (defrag.c
+     * activeDefragStringOb), and lazy server-side delete frees the value on a
+     * bio thread. Both are refused rather than silently tolerated. */
+    if (refinery_on && server.active_defrag_enabled) {
+        serverLog(LL_WARNING, "REFINERY=1 requires 'activedefrag no': active "
+                  "defrag relocates value payloads behind the OBASE runtime.");
+        exit(1);
+    }
+    if (refinery_on && server.lazyfree_lazy_server_del) {
+        serverLog(LL_WARNING, "REFINERY=1 requires 'lazyfree-lazy-server-del no' "
+                  "for the first cut (DESIGN.md e.5): a managed value would be "
+                  "freed from a bio thread.");
+        exit(1);
+    }
+    refinery_start(); /* Sama arenas + the object collector thread */
 
     if (!server.sentinel_mode) {
         /* Things not needed when running in Sentinel mode. */

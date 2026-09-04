@@ -510,8 +510,30 @@ NULL
         } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"region")) {
             refineryStatus(refinery_buf,sizeof(refinery_buf));
             addReplyBulkCString(c,refinery_buf);
+        /* Refinery (Branch A), D12: the OBASE runtime's control surface.
+         * NONE/DECAY/MIGRATE is the ObaseRTMode atomic the collector reads. */
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"none")) {
+            refinery_set_mode(0); addReply(c,shared.ok);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"decay")) {
+            refinery_set_mode(1); addReply(c,shared.ok);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"migrate")) {
+            refinery_set_mode(2); addReply(c,shared.ok);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"heaps")) {
+            char *big = zmalloc(8192);
+            refinery_heaps(big,8192);
+            addReplyBulkCString(c,big);
+            zfree(big);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"regions")) {
+            refinery_dump_regions(refinery_buf,sizeof(refinery_buf));
+            addReplyBulkCString(c,refinery_buf);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"info")) {
+            char *big = zmalloc(8192);
+            refinery_info(big,8192);
+            addReplyBulkCString(c,big);
+            zfree(big);
         } else {
-            addReplyError(c,"DEBUG REFINERY RESET|DUMP <dir>|REGION");
+            addReplyError(c,"DEBUG REFINERY RESET|DUMP <dir>|REGION|"
+                            "NONE|DECAY|MIGRATE|HEAPS|REGIONS|INFO");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"segfault")) {
         /* Compiler gives warnings about writing to a random address

@@ -490,6 +490,7 @@ robj *lookupStringForBitCommand(client *c, uint64_t maxbit, int *dirty) {
         if (dirty) *dirty = 1;
     } else {
         o = dbUnshareStringValue(c->db,c->argv[1],o);
+        refineryAssertNotGuided(o); /* Refinery (Branch A), D12: out of scope */
         size_t oldlen = sdslen(o->ptr);
         o->ptr = sdsgrowzero(o->ptr,byte+1);
         if (dirty && oldlen != sdslen(o->ptr)) *dirty = 1;
@@ -516,6 +517,10 @@ unsigned char *getObjectReadOnlyString(robj *o, long *len, char *llbuf) {
 
     /* Set the 'p' pointer to the string, that can be just a stack allocated
      * array if our string was integer encoded. */
+    /* Refinery (Branch A), D12: the bit commands are out of scope -- they hold
+     * raw interior pointers across whole loops. Fail loudly rather than read a
+     * guide word as an sds. */
+    if (o) refineryAssertNotGuided(o);
     if (o && o->encoding == OBJ_ENCODING_INT) {
         p = (unsigned char*) llbuf;
         if (len) *len = ll2string(llbuf,LONG_STR_SIZE,(long)o->ptr);

@@ -216,6 +216,11 @@ static void dbAddInternal(redisDb *db, robj *key, robj *val, int update_if_exist
     dictSetVal(db->dict, de, val);
     refineryLogWrite((char*)de + sizeof(void*), sizeof(void*),
                      REFINERY_W_DICT_VAL);
+    /* Refinery (Branch A), D12 install point #1: move the payload into a
+     * relocatable block. The value's storage was chosen by the network layer
+     * before Redis knew it was a value (DESIGN.md (c).1), so the copy here is
+     * unavoidable; it is also what makes a donated query buffer harmless. */
+    refineryValueAdopt(val);
     signalKeyAsReady(db, key, val->type);
     if (server.cluster_enabled) slotToKeyAddEntry(de, db);
     notifyKeyspaceEvent(NOTIFY_NEW,"new",key,db->id);
@@ -241,6 +246,7 @@ int dbAddRDBLoad(redisDb *db, sds key, robj *val) {
     if (de == NULL) return 0;
     initObjectLRUOrLFU(val);
     dictSetVal(db->dict, de, val);
+    refineryValueAdopt(val); /* Refinery (Branch A), D12 install point #3 */
     if (server.cluster_enabled) slotToKeyAddEntry(de, db);
     return 1;
 }
@@ -282,6 +288,8 @@ static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEnt
     dictSetVal(db->dict, de, val);
     refineryLogWrite((char*)de + sizeof(void*), sizeof(void*),
                      REFINERY_W_DICT_VAL);
+    refineryValueAdoptWritten(val); /* Refinery, D12 install point #2:
+                                    * an overwrite IS the write (F2). */
 
     if (server.lazyfree_lazy_server_del) {
         freeObjAsync(key,old,db->id);
@@ -451,7 +459,12 @@ int dbDelete(redisDb *db, robj *key) {
  */
 robj *dbUnshareStringValue(redisDb *db, robj *key, robj *o) {
     serverAssert(o->type == OBJ_STRING);
-    if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW) {
+    /* Refinery (Branch A), D12: a managed value is refcount-1 RAW as far as
+     * this test is concerned. Without this it would deep-copy and re-install on
+     * every SETRANGE/APPEND/SETBIT/PF*, which is both slow and would leave the
+     * value unmanaged. */
+    if (o->refcount != 1 ||
+        (o->encoding != OBJ_ENCODING_RAW && !objIsGuided(o))) {
         robj *decoded = getDecodedObject(o);
         o = createRawStringObject(decoded->ptr, sdslen(decoded->ptr));
         decrRefCount(decoded);

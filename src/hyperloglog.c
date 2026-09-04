@@ -1204,6 +1204,9 @@ int isHLLObjectOrReply(client *c, robj *o) {
 
     if (!sdsEncodedObject(o)) goto invalid;
     if (stringObjectLen(o) < sizeof(*hdr)) goto invalid;
+    /* Refinery (Branch A), D12: HLL values are out of scope (they cast the
+     * payload to a struct and hold interior pointers across sdsResize). */
+    refineryAssertNotGuided(o);
     hdr = o->ptr;
 
     /* Magic should be "HYLL". */

@@ -4332,6 +4332,10 @@ char *RM_StringDMA(RedisModuleKey *key, size_t *len, int mode) {
 
     /* For write access, and even for read access if the object is encoded,
      * we unshare the string (that has the side effect of decoding it). */
+    /* Refinery (Branch A), D12: RM_StringDMA hands a raw pointer into the
+     * payload out to module code for an unbounded period; modules are out of
+     * scope for the first cut. */
+    refineryAssertNotGuided(key->value);
     if ((mode & REDISMODULE_WRITE) || key->value->encoding != OBJ_ENCODING_RAW)
         key->value = dbUnshareStringValue(key->db, key->key, key->value);
 

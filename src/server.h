@@ -80,6 +80,7 @@ typedef long long ustime_t; /* microsecond time type. */
 #include "rax.h"     /* Radix tree */
 #include "connection.h" /* Connection abstraction */
 #include "refinery.h"   /* Refinery (Branch A): M1 instrumentation */
+#include "refinery_guide.h" /* Refinery (Branch A): the OBASE runtime */
 
 #define REDISMODULE_CORE 1
 typedef struct redisObject robj;
@@ -890,6 +891,16 @@ struct RedisModuleDigest {
 #define OBJ_ENCODING_QUICKLIST 9 /* Encoded as linked list of listpacks */
 #define OBJ_ENCODING_STREAM 10 /* Encoded as a radix tree of listpacks */
 #define OBJ_ENCODING_LISTPACK 11 /* Encoded as a listpack */
+#define OBJ_ENCODING_RAW_GUIDED 12 /* Refinery (Branch A), D12: a RAW string
+                                      value whose payload the OBASE runtime may
+                                      relocate. robj->ptr holds a guide word
+                                      (MLOCK|ACC|HEAP|ATC|WRITE|CIW|ADDR), not
+                                      an sds. Deliberately NOT part of
+                                      sdsEncodedObject(), so an unconverted
+                                      call site takes the "unknown string
+                                      encoding" branch -- a panic or an assert
+                                      -- instead of reading a tagged word as a
+                                      pointer. */
 
 #define LRU_BITS 24
 #define LRU_CLOCK_MAX ((1<<LRU_BITS)-1) /* Max value of obj->lru */
@@ -923,6 +934,29 @@ char *getObjectTypeName(robj*);
     _var.encoding = OBJ_ENCODING_RAW; \
     _var.ptr = _ptr; \
 } while(0)
+
+/* --- Refinery (Branch A), D12: managed string values -------------------- *
+ * objSds(o)  reads the payload of a string object that may be managed.
+ * objSdsW(o) declares a write to it (sets the WRITE bit, A1).
+ * Both are plain o->ptr for every unmanaged object, so converted call sites
+ * behave exactly as before when REFINERY=0. The macros evaluate `o` more than
+ * once: only ever pass a simple lvalue.
+ * refineryAssertNotGuided(o) is the loud guard for the string paths D12 does
+ * not convert (bitops, hyperloglog, sort, modules): they would otherwise read
+ * a guide word as an sds. */
+sds refineryValueSds(robj *o);
+sds refineryValueSdsW(robj *o);
+sds refineryValueSdsRO(robj *o);
+void refineryValueAdopt(robj *o);
+void refineryValueAdoptWritten(robj *o);
+void refineryValueReadopt(robj *o);
+void refineryValueUnguard(robj *o);
+void refineryValueRelease(robj *o);
+
+#define objIsGuided(o) ((o)->encoding == OBJ_ENCODING_RAW_GUIDED)
+#define objSds(o)  (objIsGuided(o) ? refineryValueSds(o)  : (sds)(o)->ptr)
+#define objSdsW(o) (objIsGuided(o) ? refineryValueSdsW(o) : (sds)(o)->ptr)
+#define refineryAssertNotGuided(o) serverAssert(!objIsGuided(o))
 
 struct evictionPoolEntry; /* Defined in evict.c */
 

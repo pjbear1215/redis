@@ -247,8 +247,11 @@ void feedReplicationBufferWithObject(robj *o) {
         len = ll2string(llstr,sizeof(llstr),(long)o->ptr);
         p = llstr;
     } else {
-        len = sdslen(o->ptr);
-        p = o->ptr;
+        /* Refinery (Branch A), D12: SET installs c->argv[2] itself, so the argv
+         * object a replica is fed can be a managed value. */
+        sds rs = objSds(o);
+        len = sdslen(rs);
+        p = rs;
     }
     feedReplicationBuffer(p,len);
 }
@@ -600,8 +603,10 @@ void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv,
         if (argv[j]->encoding == OBJ_ENCODING_INT) {
             cmdrepr = sdscatprintf(cmdrepr, "\"%ld\"", (long)argv[j]->ptr);
         } else {
-            cmdrepr = sdscatrepr(cmdrepr,(char*)argv[j]->ptr,
-                        sdslen(argv[j]->ptr));
+            /* Refinery (Branch A), D12: SET installs c->argv[2] itself, so a
+             * MONITOR feed can see a managed value. */
+            sds ms = objSds(argv[j]);
+            cmdrepr = sdscatrepr(cmdrepr,(char*)ms,sdslen(ms));
         }
         if (j != argc-1)
             cmdrepr = sdscatlen(cmdrepr," ",1);

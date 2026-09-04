@@ -57,6 +57,8 @@ size_t getStringObjectSdsUsedMemory(robj *o) {
     serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
     switch(o->encoding) {
     case OBJ_ENCODING_RAW: return sdsZmallocSize(o->ptr);
+    /* Refinery (Branch A), D12: the payload is not zmalloc'd. */
+    case OBJ_ENCODING_RAW_GUIDED: return sdsAllocSize(refineryValueSds(o))+8;
     case OBJ_ENCODING_EMBSTR: return zmalloc_size(o)-sizeof(robj);
     default: return 0; /* Just integer encoding for now. */
     }
@@ -68,6 +70,7 @@ size_t getStringObjectLen(robj *o) {
     serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
     switch(o->encoding) {
     case OBJ_ENCODING_RAW: return sdslen(o->ptr);
+    case OBJ_ENCODING_RAW_GUIDED: return sdslen(refineryValueSds(o));
     case OBJ_ENCODING_EMBSTR: return sdslen(o->ptr);
     default: return 0; /* Just integer encoding for now. */
     }
@@ -435,7 +438,13 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
 void addReply(client *c, robj *obj) {
     if (prepareClientToWrite(c) != C_OK) return;
 
-    if (sdsEncodedObject(obj)) {
+    if (objIsGuided(obj)) {
+        /* Refinery (Branch A), D12: the GET hot path. The payload is copied
+         * into the client's reply buffer immediately, so no derived pointer
+         * outlives the dereference (DESIGN.md e.4.1). */
+        sds gs = refineryValueSds(obj);
+        _addReplyToBufferOrList(c,gs,sdslen(gs));
+    } else if (sdsEncodedObject(obj)) {
         _addReplyToBufferOrList(c,obj->ptr,sdslen(obj->ptr));
     } else if (obj->encoding == OBJ_ENCODING_INT) {
         /* For integer encoded strings we just convert it into a string

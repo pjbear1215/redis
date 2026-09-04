@@ -479,7 +479,8 @@ void sortCommandGeneric(client *c, int readonly) {
             if (alpha) {
                 if (sortby) vector[j].u.cmpobj = getDecodedObject(byval);
             } else {
-                if (sdsEncodedObject(byval)) {
+                if (byval) refineryAssertNotGuided(byval); /* Refinery D12 */
+            if (sdsEncodedObject(byval)) {
                     char *eptr;
 
                     vector[j].u.score = strtod(byval->ptr,&eptr);

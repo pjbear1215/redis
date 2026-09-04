@@ -489,16 +489,22 @@ void setrangeCommand(client *c) {
     }
 
     if (sdslen(value) > 0) {
+        /* Refinery (Branch A), D12: sds growth goes through zrealloc, which a
+         * managed block cannot survive, so the value leaves and re-enters the
+         * managed heap around the mutation (DESIGN.md e.4.2). Two extra copies
+         * per SETRANGE; the SET/GET workload never takes this path. */
+        refineryValueUnguard(o);
         o->ptr = sdsgrowzero(o->ptr,offset+sdslen(value));
         memcpy((char*)o->ptr+offset,value,sdslen(value));
         refineryLogWrite((char*)o->ptr+offset, sdslen(value),
                          REFINERY_W_VALUE_INPLACE);
+        refineryValueReadopt(o);
         signalModifiedKey(c,c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_STRING,
             "setrange",c->argv[1],c->db->id);
         server.dirty++;
     }
-    addReplyLongLong(c,sdslen(o->ptr));
+    addReplyLongLong(c,stringObjectLen(o)); /* Refinery (Branch A), D12 */
 }
 
 void getrangeCommand(client *c) {
@@ -518,7 +524,7 @@ void getrangeCommand(client *c) {
         str = llbuf;
         strlen = ll2string(llbuf,sizeof(llbuf),(long)o->ptr);
     } else {
-        str = o->ptr;
+        str = objSds(o);
         strlen = sdslen(str);
     }
 
@@ -719,11 +725,13 @@ void appendCommand(client *c) {
 
         /* Append the value */
         o = dbUnshareStringValue(c->db,c->argv[1],o);
+        refineryValueUnguard(o); /* Refinery (Branch A), D12: see SETRANGE */
         size_t refinery_oldlen = sdslen(o->ptr);
         o->ptr = sdscatlen(o->ptr,append->ptr,sdslen(append->ptr));
         refineryLogWrite((char*)o->ptr+refinery_oldlen,
                          sdslen(append->ptr), REFINERY_W_VALUE_INPLACE);
         totlen = sdslen(o->ptr);
+        refineryValueReadopt(o);
     }
     signalModifiedKey(c,c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_STRING,"append",c->argv[1],c->db->id);

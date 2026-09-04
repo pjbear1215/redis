@@ -226,6 +226,12 @@ robj *dupStringObject(const robj *o) {
     serverAssert(o->type == OBJ_STRING);
 
     switch(o->encoding) {
+    case OBJ_ENCODING_RAW_GUIDED: {
+        /* Refinery (Branch A), D12: the copy starts life unmanaged; it is
+         * adopted when dbAdd() installs it. */
+        sds gs = refineryValueSds(o);
+        return createRawStringObject(gs,sdslen(gs));
+    }
     case OBJ_ENCODING_RAW:
         return createRawStringObject(o->ptr,sdslen(o->ptr));
     case OBJ_ENCODING_EMBSTR:
@@ -316,6 +322,13 @@ robj *createModuleObject(moduleType *mt, void *value) {
 }
 
 void freeStringObject(robj *o) {
+    /* Refinery (Branch A), D12: return the managed block to its Sama arena and
+     * clear the SODA registration of the slot. refineryValueRelease() leaves
+     * the object as an empty RAW string, so the sdsfree() below is a no-op.
+     * Reached from decrRefCount(), from the dict value destructor, and (only
+     * with lazyfree-lazy-server-del yes, which REFINERY=1 refuses) from a bio
+     * thread. */
+    if (o->encoding == OBJ_ENCODING_RAW_GUIDED) refineryValueRelease(o);
     if (o->encoding == OBJ_ENCODING_RAW) {
         sdsfree(o->ptr);
     }
@@ -618,7 +631,7 @@ int isObjectRepresentableAsLongLong(robj *o, long long *llval) {
         if (llval) *llval = (long) o->ptr;
         return C_OK;
     } else {
-        return isSdsRepresentableAsLongLong(o->ptr,llval);
+        return isSdsRepresentableAsLongLong(objSds(o),llval);
     }
 }
 
@@ -651,6 +664,12 @@ robj *tryObjectEncodingEx(robj *o, int try_trim) {
      * representations but are handled by the commands implementing
      * the type. */
     serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+
+    /* Refinery (Branch A), D12: a managed value is already installed in the
+     * keyspace; re-encoding it would free the payload behind the guide word.
+     * (This is reachable because SET installs c->argv[2] itself, so the argv
+     * object becomes managed -- DESIGN.md e.3 finding (a).) */
+    if (objIsGuided(o)) return o;
 
     /* We try some specialized encoding only for objects that are
      * RAW or EMBSTR encoded, in other words objects that are still
@@ -726,6 +745,15 @@ robj *getDecodedObject(robj *o) {
         incrRefCount(o);
         return o;
     }
+    /* Refinery (Branch A), D12: callers of getDecodedObject() hold the result's
+     * ->ptr as a raw sds across arbitrary work (BITOP holds 16 of them, LCS
+     * holds two across the whole DP), so a managed value must be handed out as
+     * an unmanaged copy rather than as itself. Not on any hot path: the callers
+     * are BITOP, SORT, LCS, DEBUG DIGEST, AOF propagation. */
+    if (objIsGuided(o)) {
+        sds gs = refineryValueSds(o);
+        return createRawStringObject(gs,sdslen(gs));
+    }
     if (o->type == OBJ_STRING && o->encoding == OBJ_ENCODING_INT) {
         char buf[32];
 
@@ -754,15 +782,15 @@ int compareStringObjectsWithFlags(const robj *a, const robj *b, int flags) {
     size_t alen, blen, minlen;
 
     if (a == b) return 0;
-    if (sdsEncodedObject(a)) {
-        astr = a->ptr;
+    if (sdsEncodedObject(a) || objIsGuided(a)) {
+        astr = objSds((robj*)a);
         alen = sdslen(astr);
     } else {
         alen = ll2string(bufa,sizeof(bufa),(long) a->ptr);
         astr = bufa;
     }
-    if (sdsEncodedObject(b)) {
-        bstr = b->ptr;
+    if (sdsEncodedObject(b) || objIsGuided(b)) {
+        bstr = objSds((robj*)b);
         blen = sdslen(bstr);
     } else {
         blen = ll2string(bufb,sizeof(bufb),(long) b->ptr);
@@ -807,8 +835,8 @@ int equalStringObjects(robj *a, robj *b) {
 
 size_t stringObjectLen(robj *o) {
     serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
-    if (sdsEncodedObject(o)) {
-        return sdslen(o->ptr);
+    if (sdsEncodedObject(o) || objIsGuided(o)) {
+        return sdslen(objSds(o));
     } else {
         return sdigits10((long)o->ptr);
     }
@@ -821,8 +849,9 @@ int getDoubleFromObject(const robj *o, double *target) {
         value = 0;
     } else {
         serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
-        if (sdsEncodedObject(o)) {
-            if (!string2d(o->ptr, sdslen(o->ptr), &value))
+        if (sdsEncodedObject(o) || objIsGuided(o)) {
+            sds gs = objSds((robj*)o);
+            if (!string2d(gs, sdslen(gs), &value))
                 return C_ERR;
         } else if (o->encoding == OBJ_ENCODING_INT) {
             value = (long)o->ptr;
@@ -855,8 +884,9 @@ int getLongDoubleFromObject(robj *o, long double *target) {
         value = 0;
     } else {
         serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
-        if (sdsEncodedObject(o)) {
-            if (!string2ld(o->ptr, sdslen(o->ptr), &value))
+        if (sdsEncodedObject(o) || objIsGuided(o)) {
+            sds gs = objSds(o);
+            if (!string2ld(gs, sdslen(gs), &value))
                 return C_ERR;
         } else if (o->encoding == OBJ_ENCODING_INT) {
             value = (long)o->ptr;
@@ -889,8 +919,9 @@ int getLongLongFromObject(robj *o, long long *target) {
         value = 0;
     } else {
         serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
-        if (sdsEncodedObject(o)) {
-            if (string2ll(o->ptr,sdslen(o->ptr),&value) == 0) return C_ERR;
+        if (sdsEncodedObject(o) || objIsGuided(o)) {
+            sds gs = objSds(o);
+            if (string2ll(gs,sdslen(gs),&value) == 0) return C_ERR;
         } else if (o->encoding == OBJ_ENCODING_INT) {
             value = (long)o->ptr;
         } else {
@@ -965,6 +996,9 @@ int getIntFromObjectOrReply(client *c, robj *o, int *target, const char *msg) {
 char *strEncoding(int encoding) {
     switch(encoding) {
     case OBJ_ENCODING_RAW: return "raw";
+    /* Refinery (Branch A), D12: a managed value is still a raw string as far
+     * as any client is concerned (DESIGN.md R4). */
+    case OBJ_ENCODING_RAW_GUIDED: return "raw";
     case OBJ_ENCODING_INT: return "int";
     case OBJ_ENCODING_HT: return "hashtable";
     case OBJ_ENCODING_QUICKLIST: return "quicklist";
@@ -1018,6 +1052,11 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
     if (o->type == OBJ_STRING) {
         if(o->encoding == OBJ_ENCODING_INT) {
             asize = sizeof(*o);
+        } else if(o->encoding == OBJ_ENCODING_RAW_GUIDED) {
+            /* Refinery (Branch A), D12: the payload is in a Sama arena, not in
+             * zmalloc'd memory, so zmalloc's size accounting does not see it;
+             * report the sds allocation plus the block prefix. */
+            asize = sdsAllocSize(refineryValueSds(o))+8+sizeof(*o);
         } else if(o->encoding == OBJ_ENCODING_RAW) {
             asize = sdsZmallocSize(o->ptr)+sizeof(*o);
         } else if(o->encoding == OBJ_ENCODING_EMBSTR) {
