@@ -304,11 +304,18 @@ extern "C" void refinery_scope_reset(void)
 
 extern "C" void refinery_exit(int code)
 {
-    if (refinery_on)
-    {
-        fflush(nullptr);
-        _exit(code);
-    }
+    /*
+     * D12 step 7: a plain exit() again. 4386eca had to _exit() because
+     * ObjectCollector's migrator loop was `while (true)` and ~ObjectCollector
+     * joined it unconditionally, so a process that built a collector hung in a
+     * static destructor. The runtime now carries a stop flag set by the
+     * destructor before the join and checked in the migrator loop, in its
+     * sleep, and in signalMigrationBegin()'s quiesce wait, so the destructors
+     * can run. refinery_scope_reset() at the four shutdown sites still has to
+     * run first, or the collector is left waiting for a scope exit() will
+     * never close. Requires an OBASE runtime with that fix linked in.
+     */
+    fflush(nullptr);
     exit(code);
 }
 
