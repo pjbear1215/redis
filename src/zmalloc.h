@@ -120,6 +120,8 @@ void *ztryrealloc_usable(void *ptr, size_t size, size_t *usable);
 void zfree_usable(void *ptr, size_t *usable);
 __attribute__((malloc)) char *zstrdup(const char *s);
 size_t zmalloc_used_memory(void);
+/* Refinery (Branch A), D12 step 6: added to used_memory when set. */
+extern size_t (*zmalloc_extra_used_cb)(void);
 void zmalloc_set_oom_handler(void (*oom_handler)(size_t));
 size_t zmalloc_get_rss(void);
 int zmalloc_get_allocator_info(size_t *allocated, size_t *active, size_t *resident);

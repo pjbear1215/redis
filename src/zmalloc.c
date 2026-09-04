@@ -407,9 +407,19 @@ char *zstrdup(const char *s) {
     return p;
 }
 
+/* Refinery (Branch A), D12 step 6: memory Redis owns but zmalloc did not
+ * allocate. A managed string value's payload lives in an OBASE arena, so
+ * without this hook used_memory reports only the robj/key/dict half and
+ * everything driven by it -- maxmemory, eviction, MEMORY USAGE totals, the
+ * rewrite triggers, mem_fragmentation_ratio -- is wrong under REFINERY=1.
+ * A function pointer rather than a direct call because zmalloc.o is also
+ * linked into redis-cli/-benchmark/-check-rdb, which do not link the shim. */
+size_t (*zmalloc_extra_used_cb)(void) = NULL;
+
 size_t zmalloc_used_memory(void) {
     size_t um;
     atomicGet(used_memory,um);
+    if (zmalloc_extra_used_cb) um += zmalloc_extra_used_cb();
     return um;
 }
 

@@ -14,6 +14,9 @@
 
 #include <jemalloc/jemalloc.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +38,8 @@ void addToTAG(ActiveScopeGuard *guard, void *varPtr);
 
 int refinery_on = 0;
 int refinery_reuse_blocks = 1;
+int refinery_robj_reuse = 0;
+int refinery_lru_copy = 1;
 
 static Sama *g_refinery_sama = nullptr;
 static ObjectCollector *g_refinery_oc = nullptr;
@@ -54,6 +59,13 @@ static std::atomic<uint64_t> g_values_released{0};
 static std::atomic<uint64_t> g_adopt_bytes{0};
 static std::atomic<uint64_t> g_release_bytes{0};
 static std::atomic<uint64_t> g_forks{0};
+/* Live bytes in managed blocks, counted at the jemalloc boundary (sallocx of
+ * what refinery_alloc handed out, minus sallocx of what refinery_release
+ * frees). refinery_disown() moves ownership between slots and must not move
+ * this. Migration reallocates the same size class in another arena, so a
+ * relocation is invisible here -- which is what makes it the right number for
+ * used_memory. */
+static std::atomic<int64_t> g_managed_bytes{0};
 
 static unsigned envUInt(const char *name, unsigned dflt)
 {
@@ -91,12 +103,20 @@ extern "C" int refinery_boot(void)
 {
     const char *e = getenv("REFINERY");
     refinery_on = (e && (*e == '1' || *e == 'y' || *e == 'Y')) ? 1 : 0;
+    {
+        /* Read before the REFINERY=0 return: B1 is a Redis-side knob and has
+         * to be settable on the stock arm too, as its own control. */
+        const char *l = getenv("REFINERY_LRU_COPY");
+        refinery_lru_copy = (l && *l == '0') ? 0 : 1;
+    }
     if (!refinery_on)
         return 0;
     refineryInitFromEnv();
     {
         const char *r = getenv("REFINERY_REDIS_REUSE");
         refinery_reuse_blocks = (r && *r == '0') ? 0 : 1;
+        const char *o = getenv("REFINERY_REDIS_ROBJ_REUSE");
+        refinery_robj_reuse = (o && *o == '1' && refinery_reuse_blocks) ? 1 : 0;
     }
     return 1;
 }
@@ -171,7 +191,17 @@ extern "C" void *refinery_alloc(size_t n)
 {
     if (!refinery_on)
         return nullptr;
-    return jem_malloc(n);
+    void *p = jem_malloc(n);
+    if (p)
+        g_managed_bytes.fetch_add((int64_t)jem_sallocx(p, 0),
+                                  std::memory_order_relaxed);
+    return p;
+}
+
+extern "C" size_t refinery_managed_bytes(void)
+{
+    int64_t v = g_managed_bytes.load(std::memory_order_relaxed);
+    return v > 0 ? (size_t)v : 0;
 }
 
 extern "C" void refinery_install(void **slot, void *p)
@@ -191,6 +221,12 @@ extern "C" void refinery_release(void **slot)
          * publishing CAS fail, so it frees its copy instead of ours. */
         addToTAG(nullptr, slot);
         g->touchAndGetAddr();
+    }
+    {
+        void *p = (void *)(uintptr_t)g->getCanonicalAddress();
+        if (p)
+            g_managed_bytes.fetch_sub((int64_t)jem_sallocx(p, 0),
+                                      std::memory_order_relaxed);
     }
     g->destroy(); /* SODA Set0 + Sama::free into the object's own arena */
     *reinterpret_cast<uintptr_t *>(slot) = 0;
@@ -226,6 +262,56 @@ extern "C" void refinery_scope_exit(void)
         reinterpret_cast<ActiveScopeGuard *>(&tl_scope_buf)->~ActiveScopeGuard();
     if (tl_scope_depth < 0)
         tl_scope_depth = 0;
+}
+
+extern "C" void refinery_scope_reset(void)
+{
+    if (!refinery_on)
+        return;
+    while (tl_scope_depth > 0)
+        refinery_scope_exit();
+}
+
+/* ---- smaps sampling (E13) ---------------------------------------------- */
+
+extern "C" void refinery_smaps_sample(const char *label)
+{
+    const char *dir = getenv("REFINERY_SNAP_DIR");
+    if (dir == nullptr || *dir == '\0')
+        return;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/smaps.txt", dir);
+    /* O_APPEND + a single writev-shaped copy: this runs inside redisFork()
+     * between the collector quiesce and fork(), so it must not allocate and
+     * must not take a lock another thread could hold. */
+    int out = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (out < 0)
+        return;
+    char hdr[192];
+    int n = snprintf(hdr, sizeof(hdr),
+                     "=== REFINERY_SAMPLE label=%s t_ms=%ld pid=%d ===\n",
+                     label, nowMs(), (int)getpid());
+    ssize_t w = write(out, hdr, n);
+    (void)w;
+    int in = open("/proc/self/smaps", O_RDONLY);
+    if (in >= 0)
+    {
+        char buf[65536];
+        ssize_t r;
+        while ((r = read(in, buf, sizeof(buf))) > 0)
+        {
+            ssize_t off = 0;
+            while (off < r)
+            {
+                ssize_t k = write(out, buf + off, (size_t)(r - off));
+                if (k <= 0)
+                    break;
+                off += k;
+            }
+        }
+        close(in);
+    }
+    close(out);
 }
 
 /* ---- fork -------------------------------------------------------------- */
@@ -324,18 +410,35 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
              "refinery_obase_hints:%d\r\n"
              "refinery_parent_ro_while_child:%d\r\n"
              "refinery_write_epoch_k:%u\r\n"
-             "refinery_fork_window_s:%u\r\n",
+             "refinery_fork_window_s:%u\r\n"
+             "refinery_reuse_blocks:%d\r\n"
+             "refinery_robj_reuse:%d\r\n"
+             "refinery_lru_copy:%d\r\n",
              refinery_on, refinery_get_mode(),
              g_refinery_write_axis ? 1 : 0, g_refinery_ro_child ? 1 : 0,
              g_refinery_obase_hints ? 1 : 0,
              g_refinery_parent_ro_while_child ? 1 : 0,
-             g_refinery_write_epoch_k, g_refinery_fork_window_s);
+             g_refinery_write_epoch_k, g_refinery_fork_window_s,
+             refinery_reuse_blocks, refinery_robj_reuse, refinery_lru_copy);
     out += line;
 
     /* Per-arena byte counts: current_size is what Sama has handed out, and
      * [base, used_end) is the range a pagemap scan must be clamped to. */
     static const char *hname[] = {"new", "hot", "cold", "write", "node"};
-    uint64_t heap_bytes[5] = {0, 0, 0, 0, 0};
+    /*
+     * Signed on purpose. Sama's extent_dalloc_hook_dram subtracts `size` from
+     * current_size and returns whatever the default dalloc hook returns; with
+     * jemalloc's default opt_retain=true that hook reports failure and
+     * jemalloc RETAINS the extent, recycling it later without calling the
+     * alloc hook again. One alloc can therefore be followed by several
+     * dallocs, so current_size drifts negative under a free-heavy workload --
+     * which is how INFO printed 18446744073687187456 (= -21.3 MiB) in the
+     * step-3/step-4 runs. The counter belongs to the shared runtime, so the
+     * fix reported here is to stop printing an unsigned underflow and to
+     * publish the arena's bump frontier, which is exact, alongside it.
+     */
+    int64_t heap_bytes[5] = {0, 0, 0, 0, 0};
+    uint64_t heap_span[5] = {0, 0, 0, 0, 0};
     if (g_refinery_sama)
     {
         for (const auto &r : g_refinery_sama->getArenaRanges())
@@ -349,7 +452,8 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
             case MemType::DRAM_NODE: idx = 4; break;
             default: idx = 0; break;
             }
-            heap_bytes[idx] += r.current_size;
+            heap_bytes[idx] += (int64_t)r.current_size;
+            heap_span[idx] += (r.pre_alloc > r.base) ? (r.pre_alloc - r.base) : 0;
             snprintf(line, sizeof(line),
                      "refinery_arena_%s_base:0x%llx\r\n"
                      "refinery_arena_%s_used_end:0x%llx\r\n",
@@ -359,12 +463,22 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
         }
     }
     snprintf(line, sizeof(line),
-             "refinery_heap_hot_bytes:%llu\r\n"
-             "refinery_heap_cold_bytes:%llu\r\n"
-             "refinery_heap_write_bytes:%llu\r\n",
-             (unsigned long long)heap_bytes[1],
-             (unsigned long long)heap_bytes[2],
-             (unsigned long long)heap_bytes[3]);
+             "refinery_heap_hot_bytes:%lld\r\n"
+             "refinery_heap_cold_bytes:%lld\r\n"
+             "refinery_heap_write_bytes:%lld\r\n"
+             "refinery_heap_new_span:%llu\r\n"
+             "refinery_heap_hot_span:%llu\r\n"
+             "refinery_heap_cold_span:%llu\r\n"
+             "refinery_heap_write_span:%llu\r\n"
+             "refinery_managed_bytes:%llu\r\n",
+             (long long)heap_bytes[1],
+             (long long)heap_bytes[2],
+             (long long)heap_bytes[3],
+             (unsigned long long)heap_span[0],
+             (unsigned long long)heap_span[1],
+             (unsigned long long)heap_span[2],
+             (unsigned long long)heap_span[3],
+             (unsigned long long)refinery_managed_bytes());
     out += line;
 
     snprintf(line, sizeof(line),

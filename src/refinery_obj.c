@@ -175,6 +175,57 @@ void refineryValueAdoptOver(robj *val, robj *old) {
     refineryValueAdoptWritten(val);
 }
 
+/* Overwrite that keeps the OLD robj as the db value (D12 step 6, B2).
+ *
+ * refineryValueAdoptOver above already reuses the old value's *block*, so the
+ * payload write lands where stock Redis's would. What it cannot avoid is that
+ * Redis replaces the value's *identity* on every SET: the network layer builds
+ * a fresh 16 B robj, dbSetValue installs it with dictSetVal() and frees the
+ * old one. Two consequences, both measured in step 5 and both invisible in the
+ * numerator:
+ *
+ *  - the new robj is a fresh 16 B allocation. jemalloc's tcache is LIFO, so
+ *    it lands at the address the PREVIOUS SET freed -- a uniformly scattered
+ *    address in the 234 MiB robj region -- and createObject() writes all 16
+ *    bytes there. A few hundred thousand SETs therefore dirty essentially
+ *    every robj page: 50,865 pages, 199 MiB, at 4.2 % write utilization.
+ *  - dictSetVal() writes 8 bytes into dictEntry.v.val, in a 24 B slab shared
+ *    with ~170 keys and entries per page: 62,491 pages at 0.32 %.
+ *
+ * Together that is 37 % of the write-aware arm's COW carrying under 1 % of the
+ * writes -- the "unmanaged half". Neither is reachable by placing the payload
+ * better, because neither is the payload. What removes both is making the
+ * value's identity stable: keep `old`, write the new bytes into its block, and
+ * never touch the robj or the dict entry.
+ *
+ * Returns `old` when it took over, NULL when the caller must proceed normally.
+ * Preconditions: `old` is managed and unshared (refcount 1 -- another holder,
+ * a slowlog entry or a Lua argv cache entry, would see the value change under
+ * it), `val` is a plain RAW string the caller owns, and old's block is big
+ * enough. The caller must NOT install `val` and must NOT free `old`.
+ */
+robj *refineryValueOverwriteInPlace(robj *val, robj *old) {
+    if (!refinery_on || !refinery_robj_reuse) return NULL;
+    if (old == NULL || old == val || !objIsGuided(old)) return NULL;
+    if (old->refcount != 1) return NULL;
+    if (val->type != OBJ_STRING || val->encoding != OBJ_ENCODING_RAW) return NULL;
+    if (val->refcount >= OBJ_FIRST_SPECIAL_REFCOUNT) return NULL;
+
+    sds ns = val->ptr;
+    char *nhdr = (char *)sdsAllocPtr(ns);
+    size_t nsz = sdsAllocSize(ns);
+    /* deref_write, not deref: this IS the write, and it is what puts the
+     * object in WRITE_HEAP (A1). */
+    char *blk = (char *)(uintptr_t)refinery_guide_deref_write(&old->ptr);
+    if (blk == NULL || refinery_block_size(blk) < REFINERY_BLK_PREFIX + nsz)
+        return NULL;
+
+    *(uint64_t *)blk = (uint64_t)(REFINERY_BLK_PREFIX + (size_t)(ns - nhdr));
+    memcpy(blk + REFINERY_BLK_PREFIX, nhdr, nsz);
+    refineryLogWrite(blk + REFINERY_BLK_PREFIX, nsz, REFINERY_W_VALUE_INPLACE);
+    return old;
+}
+
 /* Re-adopt after an in-place mutation (APPEND, SETRANGE): the mutation itself
  * is the write, so this always marks. Separate name so the call sites read as a
  * matched pair with refineryValueUnguard(). */

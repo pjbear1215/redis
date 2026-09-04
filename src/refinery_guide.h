@@ -95,6 +95,29 @@ size_t refinery_block_size(const void *p);
 /* 1 unless REFINERY_REDIS_REUSE=0: reuse the previous value's block on a
  * same-size overwrite (see refineryValueAdoptOver in refinery_obj.c). */
 extern int refinery_reuse_blocks;
+/* REFINERY_REDIS_ROBJ_REUSE=1 (default 0): on an overwrite keep the OLD robj
+ * as the db value and write the new bytes into its block, instead of
+ * installing the freshly-built argv robj. The value's *identity* becomes
+ * stable, so a SET stops rewriting the 16 B robj header and stops rewriting
+ * dictEntry.v.val -- the two unmanaged classes that carry 37 % of the COW at
+ * under 1 % write utilization (D12 step 5). Requires refinery_reuse_blocks. */
+extern int refinery_robj_reuse;
+/* REFINERY_LRU_COPY=0 (default 1) drops `val->lru = old->lru` in dbSetValue.
+ * The field feeds LRU/LFU eviction and OBJECT IDLETIME/FREQ only; under
+ * maxmemory-policy noeviction nothing reads it. B1 of D12 step 6. */
+extern int refinery_lru_copy;
+
+/* Bytes currently held in managed blocks (jem_sallocx of every live block).
+ * zmalloc_used_memory() adds this, so used_memory/maxmemory/MEMORY USAGE see
+ * the whole value again. Returns 0 when the runtime is off. */
+size_t refinery_managed_bytes(void);
+
+/* Append a labelled /proc/self/smaps sample to $REFINERY_SNAP_DIR/smaps.txt,
+ * in the same "=== REFINERY_SAMPLE label=<l> t_ms=<t> ===" framing that
+ * crest/refinery/Snapshot.cc writes, so tools/thp-coverage.py reads both.
+ * No-op when REFINERY_SNAP_DIR is unset. Works with REFINERY=0: the baseline
+ * arm needs the AnonHugePages of Redis's own je_ heap. */
+void refinery_smaps_sample(const char *label);
 
 /* ---- scopes ---------------------------------------------------------- */
 /* One pair per command (server.c call()) and one per cron pass. Nesting is
@@ -104,6 +127,12 @@ extern int refinery_reuse_blocks;
  * level-0 scope entry. */
 void refinery_scope_enter(void);
 void refinery_scope_exit(void);
+/* Close every scope this thread still holds. SHUTDOWN reaches exit(0) from
+ * inside call(), i.e. with the command's scope open; the ObjectCollector's
+ * static destructor then joins the collector, which is itself waiting in
+ * signalMigrationBegin() for that scope to be observed -- a deadlock that
+ * leaves the server hung after "Redis is now ready to exit, bye bye". */
+void refinery_scope_reset(void);
 
 /* ---- fork ------------------------------------------------------------ */
 /* Parent, immediately before fork(): publish the fork intent and wait for any

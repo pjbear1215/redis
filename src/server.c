@@ -1341,10 +1341,10 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         else if (server.last_sig_received == SIGTERM && server.shutdown_on_sigterm)
             shutdownFlags = server.shutdown_on_sigterm;
 
-        if (prepareForShutdown(shutdownFlags) == C_OK) exit(0);
+        if (prepareForShutdown(shutdownFlags) == C_OK) { refinery_scope_reset(); exit(0); }
     } else if (isShutdownInitiated()) {
         if (server.mstime >= server.shutdown_mstime || isReadyToShutdown()) {
-            if (finishShutdown() == C_OK) exit(0);
+            if (finishShutdown() == C_OK) { refinery_scope_reset(); exit(0); }
             /* Shutdown failed. Continue running. An error has been logged. */
         }
     }
@@ -1603,7 +1603,7 @@ void whileBlockedCron(void) {
     /* We received a SIGTERM during loading, shutting down here in a safe way,
      * as it isn't ok doing so inside the signal handler. */
     if (server.shutdown_asap && server.loading) {
-        if (prepareForShutdown(SHUTDOWN_NOSAVE) == C_OK) exit(0);
+        if (prepareForShutdown(SHUTDOWN_NOSAVE) == C_OK) { refinery_scope_reset(); exit(0); }
         serverLog(LL_WARNING,"SIGTERM received but errors trying to shut down the server, check the logs for more information");
         server.shutdown_asap = 0;
         server.last_sig_received = 0;
@@ -5696,6 +5696,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "mem_cluster_links:%zu\r\n"
             "mem_aof_buffer:%zu\r\n"
             "mem_allocator:%s\r\n"
+            "mem_refinery_managed:%zu\r\n"
             "active_defrag_running:%d\r\n"
             "lazyfree_pending_objects:%zu\r\n"
             "lazyfreed_objects:%zu\r\n",
@@ -5750,6 +5751,9 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             mh->cluster_links,
             mh->aof_buffer,
             ZMALLOC_LIB,
+            /* Refinery (Branch A), D12 step 6: the part of used_memory that
+             * lives in the OBASE arenas rather than in zmalloc. */
+            refinery_on ? refinery_managed_bytes() : (size_t)0,
             server.active_defrag_running,
             lazyfreeGetPendingObjectsCount(),
             lazyfreeGetFreedObjectsCount()
@@ -6643,6 +6647,12 @@ int redisFork(int purpose) {
      * collector and open the fork window before fork(). Placed in redisFork()
      * so RDB, AOF rewrite and diskless replication are covered by one edit. */
     refinery_fork_begin();
+    /* Refinery (Branch A), D12 step 6 (E13): the parent's own per-VMA
+     * AnonHugePages, at the two moments the huge-page story is decided.
+     * Taken here rather than by the driver so "fork+0" is exact -- an
+     * external sampler needs tens of milliseconds to notice the child, and
+     * at 80 kops/s that is thousands of writes of THP shattering. */
+    refinery_smaps_sample("prefork");
     if ((childpid = fork()) == 0) {
         /* Child.
          *
@@ -6673,6 +6683,7 @@ int redisFork(int purpose) {
             return -1;
         }
 
+        refinery_smaps_sample("fork+0");
         server.stat_total_forks++;
         server.stat_fork_time = ustime()-start;
         server.stat_fork_rate = (double) zmalloc_used_memory() * 1000000 / server.stat_fork_time / (1024*1024*1024); /* GB per second. */
@@ -7134,6 +7145,9 @@ int main(int argc, char **argv) {
     zmalloc_set_oom_handler(redisOutOfMemoryHandler);
     refineryInit(); /* Refinery (Branch A): before any keyspace allocation. */
     refinery_boot(); /* Refinery (Branch A), D12: read REFINERY* from the env. */
+    /* D12 step 6: teach zmalloc about the managed heap, before anything reads
+     * used_memory (maxmemory, MEMORY USAGE, the rewrite triggers). */
+    if (refinery_on) zmalloc_extra_used_cb = refinery_managed_bytes;
 
     /* To achieve entropy, in case of containers, their time() and getpid() can
      * be the same. But value of tv_usec is fast enough to make the difference */

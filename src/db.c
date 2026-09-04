@@ -47,7 +47,14 @@
 
 int expireIfNeeded(redisDb *db, robj *key, int flags);
 int keyIsExpired(redisDb *db, robj *key);
-static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de);
+/* Refinery (Branch A), D12 step 6: returns the object that ended up in the
+ * dict. That is `val` in every stock path, but with REFINERY_REDIS_ROBJ_REUSE=1
+ * an overwrite may keep the OLD robj and write into its managed block instead,
+ * in which case the caller must not take a reference to `val`. `allow_reuse`
+ * is 0 for callers that require their own object to be installed
+ * (dbReplaceValue, hence dbUnshareStringValue). */
+static robj *dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de, int allow_reuse);
+static robj *dbAddInternal(redisDb *db, robj *key, robj *val, int update_if_existing, int allow_reuse);
 
 /* Update LFU when an object is accessed.
  * Firstly, decrement the counter if the decrement time is reached.
@@ -196,12 +203,11 @@ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
  *
  * If the update_if_existing argument is false, the the program is aborted
  * if the key already exists, otherwise, it can fall back to dbOverwite. */
-static void dbAddInternal(redisDb *db, robj *key, robj *val, int update_if_existing) {
+static robj *dbAddInternal(redisDb *db, robj *key, robj *val, int update_if_existing, int allow_reuse) {
     dictEntry *existing;
     dictEntry *de = dictAddRaw(db->dict, key->ptr, &existing);
     if (update_if_existing && existing) {
-        dbSetValue(db, key, val, 1, existing);
-        return;
+        return dbSetValue(db, key, val, 1, existing, allow_reuse);
     }
     serverAssertWithInfo(NULL, key, de != NULL);
     dictSetKey(db->dict, de, sdsdup(key->ptr));
@@ -224,10 +230,11 @@ static void dbAddInternal(redisDb *db, robj *key, robj *val, int update_if_exist
     signalKeyAsReady(db, key, val->type);
     if (server.cluster_enabled) slotToKeyAddEntry(de, db);
     notifyKeyspaceEvent(NOTIFY_NEW,"new",key,db->id);
+    return val;
 }
 
 void dbAdd(redisDb *db, robj *key, robj *val) {
-    dbAddInternal(db, key, val, 0);
+    dbAddInternal(db, key, val, 0, 0);
 }
 
 /* This is a special version of dbAdd() that is used only when loading
@@ -263,13 +270,10 @@ int dbAddRDBLoad(redisDb *db, sds key, robj *val) {
  * The dictEntry input is optional, can be used if we already have one.
  *
  * The program is aborted if the key was not already present. */
-static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de) {
+static robj *dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de, int allow_reuse) {
     if (!de) de = dictFind(db->dict,key->ptr);
     serverAssertWithInfo(NULL,key,de != NULL);
     robj *old = dictGetVal(de);
-
-    val->lru = old->lru;
-    refineryLogWrite(val, 4, REFINERY_W_ROBJ_LRU);
 
     if (overwrite) {
         /* RM_StringDMA may call dbUnshareStringValue which may free val, so we
@@ -285,6 +289,26 @@ static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEnt
         /* Because of RM_StringDMA, old may be changed, so we need get old again */
         old = dictGetVal(de);
     }
+
+    /* Refinery (Branch A), D12 step 6 (B2): keep the old robj and write the
+     * new bytes into its managed block. Placed after the overwrite block so
+     * that `old` is the object the module callbacks left behind. When it takes
+     * over, the dict entry and the robj header are not written at all -- the
+     * whole point -- and neither object is freed. */
+    if (allow_reuse) {
+        robj *kept = refineryValueOverwriteInPlace(val, old);
+        if (kept) return kept;
+    }
+
+    /* B1 (REFINERY_LRU_COPY=0): the 4 B recency stamp copied into the new
+     * robj. It feeds LRU/LFU eviction and OBJECT IDLETIME/FREQ only; under
+     * maxmemory-policy noeviction nothing reads it, so dropping it is
+     * semantically free there and is the cheapest thing that could reduce
+     * robj-page COW. */
+    if (refinery_lru_copy) {
+        val->lru = old->lru;
+        refineryLogWrite(val, 4, REFINERY_W_ROBJ_LRU);
+    }
     dictSetVal(db->dict, de, val);
     refineryLogWrite((char*)de + sizeof(void*), sizeof(void*),
                      REFINERY_W_DICT_VAL);
@@ -299,12 +323,17 @@ static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEnt
         /* This is just decrRefCount(old); */
         db->dict->type->valDestructor(db->dict, old);
     }
+    return val;
 }
 
 /* Replace an existing key with a new value, we just replace value and don't
  * emit any events */
 void dbReplaceValue(redisDb *db, robj *key, robj *val) {
-    dbSetValue(db, key, val, 0, NULL);
+    /* allow_reuse = 0: every caller (INCR's slow path, SETRANGE's grow path,
+     * dbUnshareStringValue, the set-encoding conversions) hands in an object
+     * it then keeps using, so the identity it passed must be the one
+     * installed. */
+    dbSetValue(db, key, val, 0, NULL, 0);
 }
 
 /* High level Set operation. This function can be used in order to set
@@ -330,14 +359,18 @@ void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) {
     else if (!(flags & SETKEY_DOESNT_EXIST))
         keyfound = (lookupKeyWrite(db,key) != NULL);
 
+    robj *installed = val;
     if (!keyfound) {
         dbAdd(db,key,val);
     } else if (keyfound<0) {
-        dbAddInternal(db,key,val,1);
+        installed = dbAddInternal(db,key,val,1,1);
     } else {
-        dbSetValue(db,key,val,1,NULL);
+        installed = dbSetValue(db,key,val,1,NULL,1);
     }
-    incrRefCount(val);
+    /* Refinery (Branch A), D12 step 6: with REFINERY_REDIS_ROBJ_REUSE=1 an
+     * overwrite keeps the old robj, so the db took no reference to `val` and
+     * the caller's object is freed with the client's argv as usual. */
+    if (installed == val) incrRefCount(val);
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db,key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c,db,key);
 }
@@ -1268,7 +1301,12 @@ void shutdownCommand(client *c) {
     }
 
     blockClientShutdown(c);
-    if (prepareForShutdown(flags) == C_OK) exit(0);
+    /* Refinery (Branch A), D12 step 6: exit(0) here runs the
+     * ObjectCollector's static destructor, which joins the collector --
+     * and the collector is waiting in signalMigrationBegin() for this
+     * thread's still-open command scope. Closing it first is what makes
+     * a clean SHUTDOWN terminate instead of hanging after 'bye bye'. */
+    if (prepareForShutdown(flags) == C_OK) { refinery_scope_reset(); exit(0); }
     /* If we're here, then shutdown is ongoing (the client is still blocked) or
      * failed (the client has received an error). */
 }

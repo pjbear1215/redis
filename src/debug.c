@@ -526,6 +526,12 @@ NULL
         } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"regions")) {
             refinery_dump_regions(refinery_buf,sizeof(refinery_buf));
             addReplyBulkCString(c,refinery_buf);
+        } else if (c->argc == 4 && !strcasecmp(c->argv[2]->ptr,"smaps")) {
+            /* D12 step 6 (E13): append a labelled /proc/self/smaps sample to
+             * REFINERY_SNAP_DIR/smaps.txt, so the driver can take
+             * child-pre-exit and T+60 s from outside. */
+            refinery_smaps_sample(c->argv[3]->ptr);
+            addReply(c,shared.ok);
         } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"info")) {
             char *big = zmalloc(8192);
             refinery_info(big,8192);
@@ -533,7 +539,8 @@ NULL
             zfree(big);
         } else {
             addReplyError(c,"DEBUG REFINERY RESET|DUMP <dir>|REGION|"
-                            "NONE|DECAY|MIGRATE|HEAPS|REGIONS|INFO");
+                            "NONE|DECAY|MIGRATE|HEAPS|REGIONS|INFO|"
+                            "SMAPS <label>");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"segfault")) {
         /* Compiler gives warnings about writing to a random address
