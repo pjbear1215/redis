@@ -1388,6 +1388,12 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     databasesCron();
     refinery_scope_exit();
 
+    /* Refinery (Branch A), RSS fix: once the collector has migrated every
+     * managed block out of the NEW arena, discard it in one call. Outside the
+     * scope above on purpose -- it must not run while the collector is
+     * quiescing, and it takes no guide word. No-op unless REFINERY_NEW_RESET=1. */
+    refinery_new_reset_tick();
+
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. */
     if (!hasActiveChildProcess() &&

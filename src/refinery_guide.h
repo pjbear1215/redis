@@ -77,9 +77,17 @@ uint64_t refinery_guide_deref_ro(void **slot);
 void refinery_mark_write(void **slot);
 
 /* ---- managed blocks -------------------------------------------------- */
-/* Allocate `n` bytes in the NEW heap (jem_malloc; the collector promotes it
- * later). Returns NULL if the runtime is off. */
+/* Allocate `n` bytes in the NEW heap and count it towards used_memory. With
+ * REFINERY_MANAGED_NEW=0 that is jem_malloc(), i.e. the OBASE allocator's
+ * default arenas; with =1 it is the DRAM_NEW Sama arena. Either way the
+ * collector promotes the block out later. Returns NULL if the runtime is off. */
 void *refinery_alloc(size_t n);
+/* Refinery (Branch A), RSS fix: one attempt at arena.<new>.reset, from
+ * serverCron. No-op unless REFINERY_NEW_RESET=1, and Sama refuses the reset
+ * unless nothing is live in the NEW arena. MAIN THREAD ONLY -- jemalloc
+ * requires that no other operation touches an arena being reset, and the main
+ * thread is the only one that allocates managed blocks. */
+void refinery_new_reset_tick(void);
 /* Zero `slot`, register it in SODA and publish `p` in it. After this the slot
  * is a guide word. */
 void refinery_install(void **slot, void *p);

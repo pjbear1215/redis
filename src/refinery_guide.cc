@@ -163,6 +163,14 @@ extern "C" void refinery_start(void)
     std::vector<MemType> types = {MemType::DRAM, MemType::DRAM_2MB_THP};
     if (g_refinery_write_axis)
         types.push_back(MemType::DRAM_2MB_THP_W);
+    /*
+     * Refinery (Branch A), RSS fix: the managed NEW arena, appended LAST for
+     * the same reason ProcessCommand.h appends it last -- arena indices are
+     * assigned in creation order, so COLD/HOT/WRITE keep the indices, flags
+     * and address layout they had in every earlier arm.
+     */
+    if (g_refinery_managed_new)
+        types.push_back(MemType::DRAM_NEW);
     g_refinery_sama = new Sama(types);
     g_sama = g_refinery_sama;
 
@@ -218,15 +226,68 @@ extern "C" void refinery_mark_write(void **slot)
 
 /* ---- managed blocks ---------------------------------------------------- */
 
+/*
+ * Refinery (Branch A), RSS fix. refineryNewAlloc() is jem_malloc() -- the
+ * OBASE allocator's DEFAULT arenas -- unless REFINERY_MANAGED_NEW=1, in which
+ * case the block is bump-allocated out of the DRAM_NEW Sama arena instead,
+ * exactly as CrestKV's three birth sites do (phase 2e A). Nothing downstream
+ * changes: HEAP_ID stays 0, the collector still promotes/demotes the object,
+ * and refinery_release()'s Guide::destroy() routes the free back to whichever
+ * allocator handed the block out (Sama.h refineryNewHeapType, by address).
+ *
+ * Why it matters here: with the blocks born in the default arenas, migration
+ * frees them one scattered 320 B region at a time and a jemalloc slab is only
+ * released when its LAST region goes, so a few per cent of survivors pinned
+ * 1 426.8 MiB of slab pages on 1 574.0 MiB of live bytes
+ * (rss-overhead-2026-09-05). Born in an arena of their own, the whole
+ * population can be discarded in one arena.<new>.reset once the collector has
+ * drained it (refinery_new_reset_tick below).
+ *
+ * used_memory accounting is unchanged: g_managed_bytes is still counted at the
+ * jemalloc boundary with jem_sallocx, which reports the usable size of any
+ * jemalloc-owned block regardless of arena, and the 320 B size class is the
+ * same in a manual arena as in a default one.
+ */
 extern "C" void *refinery_alloc(size_t n)
 {
     if (!refinery_on)
         return nullptr;
-    void *p = jem_malloc(n);
+    void *p = refineryNewAlloc(n);
     if (p)
         g_managed_bytes.fetch_add((int64_t)jem_sallocx(p, 0),
                                   std::memory_order_relaxed);
     return p;
+}
+
+/*
+ * Refinery (Branch A), RSS fix: the arena.<new>.reset trigger, called once per
+ * serverCron pass. REFINERY_NEW_RESET=0 (the default) makes it a no-op.
+ *
+ * It runs on the MAIN THREAD on purpose. jemalloc requires that nothing else
+ * touches an arena while it is being reset, and the main thread is the only
+ * one that allocates managed blocks: every birth site is a db install point
+ * (refineryValueAdopt from dbAdd/dbSetValue/dbAddRDBLoad), and REFINERY=1
+ * already refuses to start with lazyfree-lazy-server-del, so no bio thread
+ * frees one either. Sama::resetNewArena() then refuses unless its own live-byte
+ * accounting for the arena is exactly 0, which is the real assertion -- reset
+ * discards ALL of an arena's allocations, so it is sound only on an empty one.
+ *
+ * Suppressed while a checkpoint is in flight or a child is alive: the reset
+ * madvises the NEW arena's pages away, and doing that under a live child would
+ * change what the parent re-faults, i.e. perturb the very COW measurement the
+ * campaign takes. Suppressed during a collector round for the same
+ * belt-and-braces reason -- serverCron runs 10x a second and will find a quiet
+ * pass.
+ */
+extern "C" void refinery_new_reset_tick(void)
+{
+    if (!refinery_on || !g_refinery_new_reset || g_refinery_sama == nullptr)
+        return;
+    if (g_oc_round_active.load(std::memory_order_seq_cst) ||
+        g_fork_in_flight.load(std::memory_order_seq_cst) ||
+        g_snapshot_child_alive.load(std::memory_order_seq_cst))
+        return;
+    g_refinery_sama->resetNewArena();
 }
 
 extern "C" size_t refinery_managed_bytes(void)
@@ -625,6 +686,25 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
              (unsigned long long)g_placement_moved_under_child.load(),
              (unsigned long long)g_placement_delta_under_child.load(),
              (unsigned long long)g_stat_parent_ro_cas_suppressed.load());
+    out += line;
+
+    /* Refinery (Branch A), RSS fix: the managed NEW arena and its reset.
+     * new_live_bytes is the assertion the reset is conditioned on, so it is
+     * reported next to the two outcomes -- a run whose skipped_live grows
+     * while resets stays 0 is a run in which NEW never drained. Its own
+     * snprintf so the fixed line buffers above keep their headroom. */
+    snprintf(line, sizeof(line),
+             "refinery_managed_new:%d\r\n"
+             "refinery_new_reset:%d\r\n"
+             "refinery_migrate_addr_order:%d\r\n"
+             "refinery_new_live_bytes:%llu\r\n"
+             "refinery_new_arena_resets:%llu\r\n"
+             "refinery_new_reset_skipped_live:%llu\r\n",
+             g_refinery_managed_new ? 1 : 0, g_refinery_new_reset ? 1 : 0,
+             g_refinery_migrate_addr_order ? 1 : 0,
+             (unsigned long long)Sama::new_live_bytes.load(),
+             (unsigned long long)g_stat_new_arena_resets.load(),
+             (unsigned long long)g_stat_new_reset_skipped_live.load());
     out += line;
 
     return copyOut(buf, buflen, out);
