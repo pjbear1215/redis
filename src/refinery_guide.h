@@ -170,6 +170,15 @@ size_t refinery_heaps(char *buf, size_t buflen);
 /* Walk SODA and write regions-slots.bin / regions-obj-h{0..3}.bin into
  * REFINERY_SNAP_DIR. One line of status into buf. */
 size_t refinery_dump_regions(char *buf, size_t buflen);
+/* The OBASE allocator's own stats (jem_mallctl "stats.*", per-arena
+ * pactive/pdirty/pmuzzy) plus the glibc heap's mallinfo2. This is the term
+ * that neither INFO memory (Redis's je_ allocator) nor INFO refinery (the Sama
+ * arena spans) can see: the jem_ DEFAULT arenas, where refinery_alloc() is
+ * born and where the collector's migration source is freed. Read-only. */
+size_t refinery_jemstats(char *buf, size_t buflen);
+/* arena.<ALL>.purge on the OBASE allocator, on demand. The collector already
+ * issues it every round; this only allows a probe to issue it between rounds. */
+void refinery_purge(void);
 /* Counters the host maintains (values adopted/released, bytes) so INFO can
  * report them next to the runtime's own. */
 void refinery_note_adopt(size_t bytes);

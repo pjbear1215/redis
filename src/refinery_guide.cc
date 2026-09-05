@@ -15,6 +15,7 @@
 #include <jemalloc/jemalloc.h>
 
 #include <fcntl.h>
+#include <malloc.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -637,4 +638,75 @@ extern "C" size_t refinery_heaps(char *buf, size_t buflen)
 extern "C" size_t refinery_dump_regions(char *buf, size_t buflen)
 {
     return copyOut(buf, buflen, refineryDumpRegions());
+}
+
+/*
+ * Refinery (Branch A), RSS-overhead study: the OBASE allocator's own view of
+ * itself, next to the glibc heap. INFO memory reports Redis's je_ jemalloc and
+ * INFO refinery reports the Sama arena spans; between the two sits the jem_
+ * allocator's DEFAULT arenas, where every managed block is born
+ * (refinery_alloc -> jem_malloc) and where its source copy is freed after the
+ * collector migrates it. Nothing here allocates or frees: `epoch` refreshes the
+ * statistics cache, everything else is a read.
+ */
+static size_t jemStat(const char *key)
+{
+    size_t v = 0, s = sizeof(v);
+    return jem_mallctl(key, &v, &s, nullptr, 0) ? (size_t)-1 : v;
+}
+
+extern "C" size_t refinery_jemstats(char *buf, size_t buflen)
+{
+    uint64_t ep = 1;
+    size_t eps = sizeof(ep);
+    jem_mallctl("epoch", &ep, &eps, &ep, eps);
+
+    std::string out;
+    char line[256];
+    snprintf(line, sizeof(line),
+             "JEM allocated=%zu active=%zu metadata=%zu resident=%zu mapped=%zu retained=%zu\n",
+             jemStat("stats.allocated"), jemStat("stats.active"),
+             jemStat("stats.metadata"), jemStat("stats.resident"),
+             jemStat("stats.mapped"), jemStat("stats.retained"));
+    out += line;
+
+    unsigned narenas = 0;
+    size_t ns = sizeof(narenas);
+    jem_mallctl("arenas.narenas", &narenas, &ns, nullptr, 0);
+    for (unsigned i = 0; i < narenas; i++)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "stats.arenas.%u.pactive", i);
+        size_t pactive = jemStat(key);
+        if (pactive == (size_t)-1)
+            continue; /* arena slot never initialised */
+        snprintf(key, sizeof(key), "stats.arenas.%u.pdirty", i);
+        size_t pdirty = jemStat(key);
+        snprintf(key, sizeof(key), "stats.arenas.%u.pmuzzy", i);
+        size_t pmuzzy = jemStat(key);
+        snprintf(key, sizeof(key), "stats.arenas.%u.mapped", i);
+        size_t mapped = jemStat(key);
+        snprintf(line, sizeof(line),
+                 "JEM arena %u pactive=%zu pdirty=%zu pmuzzy=%zu mapped=%zu\n",
+                 i, pactive, pdirty, pmuzzy, mapped);
+        out += line;
+    }
+
+    struct mallinfo2 mi = mallinfo2();
+    snprintf(line, sizeof(line),
+             "GLIBC arena=%zu hblkhd=%zu uordblks=%zu fordblks=%zu keepcost=%zu\n",
+             (size_t)mi.arena, (size_t)mi.hblkhd, (size_t)mi.uordblks,
+             (size_t)mi.fordblks, (size_t)mi.keepcost);
+    out += line;
+    return copyOut(buf, buflen, out);
+}
+
+/* arena.<ALL>.purge on the OBASE allocator. The collector already calls this
+ * at the end of every round (ObjectCollector.cc); this only lets a probe ask
+ * for it BETWEEN rounds, to separate "held by decay timing" from "held by a
+ * slab that still has a live region in it". */
+extern "C" void refinery_purge(void)
+{
+    if (g_refinery_sama != nullptr)
+        g_refinery_sama->purgeUnused();
 }

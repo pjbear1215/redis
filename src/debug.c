@@ -537,10 +537,19 @@ NULL
             refinery_info(big,8192);
             addReplyBulkCString(c,big);
             zfree(big);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"jemstats")) {
+            /* The OBASE allocator's own accounting, for the RSS decomposition:
+             * INFO memory sees only Redis's je_ jemalloc. */
+            char *big = zmalloc(8192);
+            refinery_jemstats(big,8192);
+            addReplyBulkCString(c,big);
+            zfree(big);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"purge")) {
+            refinery_purge(); addReply(c,shared.ok);
         } else {
             addReplyError(c,"DEBUG REFINERY RESET|DUMP <dir>|REGION|"
                             "NONE|DECAY|MIGRATE|HEAPS|REGIONS|INFO|"
-                            "SMAPS <label>");
+                            "JEMSTATS|PURGE|SMAPS <label>");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"segfault")) {
         /* Compiler gives warnings about writing to a random address
