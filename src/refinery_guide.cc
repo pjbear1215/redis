@@ -170,7 +170,13 @@ extern "C" void refinery_start(void)
      * and address layout they had in every earlier arm.
      */
     if (g_refinery_managed_new)
+    {
         types.push_back(MemType::DRAM_NEW);
+        /* REFINERY_NEW_DOUBLE: the second half of the double buffer. Appended
+         * after the first for the same index-stability reason. */
+        if (g_refinery_new_double)
+            types.push_back(MemType::DRAM_NEW);
+    }
     g_refinery_sama = new Sama(types);
     g_sama = g_refinery_sama;
 
@@ -278,6 +284,13 @@ extern "C" void *refinery_alloc(size_t n)
  * campaign takes. Suppressed during a collector round for the same
  * belt-and-braces reason -- serverCron runs 10x a second and will find a quiet
  * pass.
+ *
+ * With REFINERY_NEW_DOUBLE=1 this is also where the epoch flip happens, for
+ * exactly the same reasons: the flip decides where the next birth goes, and
+ * births are main-thread, so doing it anywhere else would race. One attempt
+ * every REFINERY_NEW_FLIP_ROUNDS collector rounds -- the drain the flip waits
+ * for takes a round (an object leaves NEW on the first round that classifies
+ * it), so a cron-rate retry would only inflate the deferred counter.
  */
 extern "C" void refinery_new_reset_tick(void)
 {
@@ -287,7 +300,15 @@ extern "C" void refinery_new_reset_tick(void)
         g_fork_in_flight.load(std::memory_order_seq_cst) ||
         g_snapshot_child_alive.load(std::memory_order_seq_cst))
         return;
-    g_refinery_sama->resetNewArena();
+    g_refinery_sama->resetDrainedNewArenas();
+    if (!g_refinery_new_double)
+        return;
+    static uint64_t last_flip_round = 0;
+    uint64_t rounds = g_stat_oc_rounds_run.load(std::memory_order_relaxed);
+    if (rounds - last_flip_round < (uint64_t)g_refinery_new_flip_rounds)
+        return;
+    last_flip_round = rounds;
+    g_refinery_sama->flipNewArena();
 }
 
 extern "C" size_t refinery_managed_bytes(void)
@@ -602,6 +623,9 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
      */
     int64_t heap_bytes[5] = {0, 0, 0, 0, 0};
     uint64_t heap_span[5] = {0, 0, 0, 0, 0};
+    /* Per-NEW-arena spans, so a double-buffered run can be read arena by
+     * arena rather than as one summed NEW span. */
+    uint64_t new_span[Sama::MaxNewArenas] = {0, 0};
     if (g_refinery_sama)
     {
         for (const auto &r : g_refinery_sama->getArenaRanges())
@@ -615,13 +639,33 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
             case MemType::DRAM_NODE: idx = 4; break;
             default: idx = 0; break;
             }
+            uint64_t span = (r.pre_alloc > r.base) ? (r.pre_alloc - r.base) : 0;
             heap_bytes[idx] += (int64_t)r.current_size;
-            heap_span[idx] += (r.pre_alloc > r.base) ? (r.pre_alloc - r.base) : 0;
+            heap_span[idx] += span;
+            /* There can be TWO DRAM_NEW arenas, and INFO keys must stay
+             * unique, so the second is named "new1". The slot comes from the
+             * same address discriminator the free path uses, so the label is
+             * stable across calls even though getArenaRanges() walks a hash
+             * map in unspecified order. */
+            const char *nm = hname[idx];
+            char nbuf[8];
+            int slot = (r.type == MemType::DRAM_NEW)
+                           ? refineryNewArenaSlot((uintptr_t)r.base)
+                           : -1;
+            if (slot >= 0)
+            {
+                new_span[slot] = span;
+                if (slot > 0)
+                {
+                    snprintf(nbuf, sizeof(nbuf), "new%d", slot);
+                    nm = nbuf;
+                }
+            }
             snprintf(line, sizeof(line),
                      "refinery_arena_%s_base:0x%llx\r\n"
                      "refinery_arena_%s_used_end:0x%llx\r\n",
-                     hname[idx], (unsigned long long)r.base,
-                     hname[idx], (unsigned long long)r.pre_alloc);
+                     nm, (unsigned long long)r.base,
+                     nm, (unsigned long long)r.pre_alloc);
             out += line;
         }
     }
@@ -696,14 +740,46 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
     snprintf(line, sizeof(line),
              "refinery_managed_new:%d\r\n"
              "refinery_new_reset:%d\r\n"
+             "refinery_new_double:%d\r\n"
+             "refinery_new_flip_rounds:%u\r\n"
+             "refinery_new_arenas:%d\r\n"
+             "refinery_new_active:%d\r\n"
              "refinery_new_live_bytes:%llu\r\n"
              "refinery_new_arena_resets:%llu\r\n"
-             "refinery_new_reset_skipped_live:%llu\r\n",
+             "refinery_new_reset_skipped_live:%llu\r\n"
+             "refinery_new_flips:%llu\r\n"
+             "refinery_new_flips_deferred:%llu\r\n",
              g_refinery_managed_new ? 1 : 0, g_refinery_new_reset ? 1 : 0,
-             (unsigned long long)Sama::new_live_bytes.load(),
+             g_refinery_new_double ? 1 : 0, g_refinery_new_flip_rounds,
+             Sama::new_arena_count,
+             Sama::new_active.load(std::memory_order_relaxed),
+             (unsigned long long)Sama::newLiveBytes(),
              (unsigned long long)g_stat_new_arena_resets.load(),
-             (unsigned long long)g_stat_new_reset_skipped_live.load());
+             (unsigned long long)g_stat_new_reset_skipped_live.load(),
+             (unsigned long long)g_stat_new_flips.load(),
+             (unsigned long long)g_stat_new_flips_deferred.load());
     out += line;
+
+    /* Per-arena, so a double-buffered run shows the two halves taking turns:
+     * one arena's live bytes and span growing while the other's are zero and
+     * its reset count climbs. peak_epoch is the largest amount ever born into
+     * an arena between two of its resets, i.e. the rolling NEW working set. */
+    for (int i = 0; i < Sama::new_arena_count; i++)
+    {
+        const Sama::NewArena &n = Sama::new_arenas[i];
+        snprintf(line, sizeof(line),
+                 "refinery_new%d_live_bytes:%llu\r\n"
+                 "refinery_new%d_span:%llu\r\n"
+                 "refinery_new%d_epoch_bytes:%llu\r\n"
+                 "refinery_new%d_peak_epoch_bytes:%llu\r\n"
+                 "refinery_new%d_resets:%llu\r\n",
+                 i, (unsigned long long)n.live_bytes.load(),
+                 i, (unsigned long long)new_span[i],
+                 i, (unsigned long long)n.alloc_since_reset.load(),
+                 i, (unsigned long long)n.peak_epoch_bytes.load(),
+                 i, (unsigned long long)n.resets.load());
+        out += line;
+    }
 
     return copyOut(buf, buflen, out);
 }

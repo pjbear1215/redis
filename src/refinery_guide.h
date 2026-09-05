@@ -83,10 +83,12 @@ void refinery_mark_write(void **slot);
  * collector promotes the block out later. Returns NULL if the runtime is off. */
 void *refinery_alloc(size_t n);
 /* Refinery (Branch A), RSS fix: one attempt at arena.<new>.reset, from
- * serverCron. No-op unless REFINERY_NEW_RESET=1, and Sama refuses the reset
- * unless nothing is live in the NEW arena. MAIN THREAD ONLY -- jemalloc
- * requires that no other operation touches an arena being reset, and the main
- * thread is the only one that allocates managed blocks. */
+ * serverCron, plus the REFINERY_NEW_DOUBLE epoch flip. No-op unless
+ * REFINERY_NEW_RESET=1, and Sama refuses the reset unless nothing is live in
+ * the arena it is about to discard. MAIN THREAD ONLY -- jemalloc requires that
+ * no other operation touches an arena being reset, the flip decides where the
+ * next birth goes, and the main thread is the only one that allocates managed
+ * blocks. */
 void refinery_new_reset_tick(void);
 /* Zero `slot`, register it in SODA and publish `p` in it. After this the slot
  * is a guide word. */
