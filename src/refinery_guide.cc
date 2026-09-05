@@ -696,12 +696,10 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
     snprintf(line, sizeof(line),
              "refinery_managed_new:%d\r\n"
              "refinery_new_reset:%d\r\n"
-             "refinery_migrate_addr_order:%d\r\n"
              "refinery_new_live_bytes:%llu\r\n"
              "refinery_new_arena_resets:%llu\r\n"
              "refinery_new_reset_skipped_live:%llu\r\n",
              g_refinery_managed_new ? 1 : 0, g_refinery_new_reset ? 1 : 0,
-             g_refinery_migrate_addr_order ? 1 : 0,
              (unsigned long long)Sama::new_live_bytes.load(),
              (unsigned long long)g_stat_new_arena_resets.load(),
              (unsigned long long)g_stat_new_reset_skipped_live.load());
