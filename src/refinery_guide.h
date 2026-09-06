@@ -91,8 +91,14 @@ void *refinery_alloc(size_t n);
  * blocks. */
 void refinery_new_reset_tick(void);
 /* Zero `slot`, register it in SODA and publish `p` in it. After this the slot
- * is a guide word. */
+ * is a guide word. With REFINERY_DECLARED=1 the word is also stamped with the
+ * declared class (COLD), which the collector reads. */
 void refinery_install(void **slot, void *p);
+/* The guide word's heap id, and a way to restore one. The block-reuse path
+ * moves an existing block between guide slots and refinery_install would
+ * restamp it; in the declared arm the class has to survive the move. */
+unsigned char refinery_heap_id(void **slot);
+void refinery_set_heap_id(void **slot, unsigned char id);
 /* Unregister `slot` and free the block it points at into its own arena.
  * Leaves the slot zeroed. */
 void refinery_release(void **slot);
@@ -116,6 +122,12 @@ extern int refinery_robj_reuse;
  * The field feeds LRU/LFU eviction and OBJECT IDLETIME/FREQ only; under
  * maxmemory-policy noeviction nothing reads it. B1 of D12 step 6. */
 extern int refinery_lru_copy;
+/* REFINERY_DECLARED=1 (default 0), D17: refinery_alloc() births the block in
+ * its declared destination class (COLD) instead of in a NEW stage the
+ * collector must copy it out of, and refinery_install() stamps that class on
+ * the guide word. Inference still runs and may promote the object to
+ * HOT/WRITE. No NEW arena is created, so arena indices are unchanged. */
+extern int refinery_declared;
 
 /* Bytes currently held in managed blocks (jem_sallocx of every live block).
  * zmalloc_used_memory() adds this, so used_memory/maxmemory/MEMORY USAGE see

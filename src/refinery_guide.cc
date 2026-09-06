@@ -41,6 +41,7 @@ int refinery_on = 0;
 int refinery_reuse_blocks = 1;
 int refinery_robj_reuse = 0;
 int refinery_lru_copy = 1;
+int refinery_declared = 0;
 /* I1: how long refinery_fork_begin() may wait for a collector round before it
  * gives up and fails the fork. REFINERY_FORK_WAIT_MAX_S, seconds. */
 static unsigned refinery_fork_wait_max_s = 120;
@@ -67,6 +68,8 @@ static std::atomic<uint64_t> g_forks{0};
  * and the longest wait a fork that did proceed actually served out. */
 static std::atomic<uint64_t> g_fork_wait_timeouts{0};
 static std::atomic<uint64_t> g_fork_wait_ms_max{0};
+/* D17: blocks born directly in their declared destination class. */
+static std::atomic<uint64_t> g_stat_declared_births{0};
 /*
  * I2, measured over exactly the child's life rather than inferred from a flag.
  * The four placement counters are snapshotted at the instant
@@ -147,6 +150,12 @@ extern "C" int refinery_boot(void)
         refinery_reuse_blocks = (r && *r == '0') ? 0 : 1;
         const char *o = getenv("REFINERY_REDIS_ROBJ_REUSE");
         refinery_robj_reuse = (o && *o == '1' && refinery_reuse_blocks) ? 1 : 0;
+        /* D17: declared allocation. Redis knows at the db install point that a
+         * string value is long-lived and relocation-eligible, so the block is
+         * born in its destination class instead of in a NEW stage the
+         * collector then has to copy out of. */
+        const char *d = getenv("REFINERY_DECLARED");
+        refinery_declared = (d && *d == '1') ? 1 : 0;
         refinery_fork_wait_max_s = envUInt("REFINERY_FORK_WAIT_MAX_S", 120);
     }
     return 1;
@@ -258,7 +267,37 @@ extern "C" void *refinery_alloc(size_t n)
 {
     if (!refinery_on)
         return nullptr;
-    void *p = refineryNewAlloc(n);
+    /*
+     * D17, the declared arm. Two arena-discard designs failed because the NEW
+     * stage cannot be reclaimed under load (rss-fix-, rss-dbl-2026-09-05): the
+     * last few per cent of the initial population always pin it. Declaration
+     * removes the stage instead. Redis states at the db install point what it
+     * knows -- this value is long-lived and relocation-eligible -- and the
+     * block is bump-allocated straight into its destination class, COLD, the
+     * class demoteColdObjects() itself sends a never-again-touched value to
+     * (75 % of the 5 M population took exactly that NEW -> COLD path, in one
+     * round, in the rss-fix archive). No NEW arena is created, so COLD/HOT/
+     * WRITE keep the arena indices and address layout of every earlier arm;
+     * inference is untouched and may still promote the object to HOT/WRITE.
+     */
+    void *p;
+    if (refinery_declared)
+    {
+        /* g_refinery_sama exists before any db install point (refinery_start()
+         * runs ahead of loadDataFromDisk()), so this guard is unreachable. It
+         * fails CLOSED rather than birthing in the default arenas under a COLD
+         * stamp: the value simply stays unmanaged, which is what every other
+         * failure on this path does. */
+        if (g_refinery_sama == nullptr)
+            return nullptr;
+        p = g_refinery_sama->malloc(n, MemType::DRAM);
+        if (p)
+            g_stat_declared_births.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        p = refineryNewAlloc(n);
+    }
     if (p)
         g_managed_bytes.fetch_add((int64_t)jem_sallocx(p, 0),
                                   std::memory_order_relaxed);
@@ -322,6 +361,33 @@ extern "C" void refinery_install(void **slot, void *p)
     *reinterpret_cast<uintptr_t *>(slot) = 0;
     Guide<void> *g = reinterpret_cast<Guide<void> *>(slot);
     *g = p; /* SODA Set1 on &slot, then touchAndGetAddr() */
+    /*
+     * D17: publish the declared class in the guide word. Guide::operator=
+     * resets HEAP_ID to 0, and 0 is not a spare value -- getMemType() then
+     * answers NEW_HEAP for a block that is in COLD (so Guide::destroy() frees
+     * it with the wrong arena's mallocx flags), and, worse,
+     * demoteColdObjects() reads `heapId != COLD_HEAP` for every object and
+     * migrates the entire store into the arena it is already in. The stamp is
+     * what makes the declaration visible to the collector.
+     */
+    if (refinery_declared)
+        g->setHeapId(2 /* ObjectCollector::COLD_HEAP */);
+}
+
+/* D17: the guide word's heap id, and a way to put one back. The block-reuse
+ * path (refineryValueAdoptOver) hands an EXISTING block from one guide slot to
+ * another, and the block may already have been promoted to HOT or WRITE; the
+ * install above would restamp it COLD and the next collector round would copy
+ * it back. Declaration has to survive an overwrite, so the reuse path carries
+ * the class across. */
+extern "C" unsigned char refinery_heap_id(void **slot)
+{
+    return reinterpret_cast<Guide<void> *>(slot)->getHeapId();
+}
+
+extern "C" void refinery_set_heap_id(void **slot, unsigned char id)
+{
+    reinterpret_cast<Guide<void> *>(slot)->setHeapId(id);
 }
 
 extern "C" void refinery_release(void **slot)
@@ -730,6 +796,19 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
              (unsigned long long)g_placement_moved_under_child.load(),
              (unsigned long long)g_placement_delta_under_child.load(),
              (unsigned long long)g_stat_parent_ro_cas_suppressed.load());
+    out += line;
+
+    /* D17, the declared arm. births = blocks that skipped the NEW stage
+     * entirely; later_moved = departures from COLD the inference still made,
+     * i.e. the copies declaration did NOT remove. Its own snprintf so the
+     * fixed line buffer above keeps its headroom. */
+    snprintf(line, sizeof(line),
+             "refinery_declared:%d\r\n"
+             "refinery_declared_births:%llu\r\n"
+             "refinery_declared_later_moved:%llu\r\n",
+             refinery_declared,
+             (unsigned long long)g_stat_declared_births.load(),
+             (unsigned long long)g_stat_moved_out_of_cold.load());
     out += line;
 
     /* Refinery (Branch A), RSS fix: the managed NEW arena and its reset.

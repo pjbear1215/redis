@@ -192,11 +192,16 @@ void refineryValueAdoptOver(robj *val, robj *old) {
             refineryLogWrite(blk + REFINERY_BLK_PREFIX, need - REFINERY_BLK_PREFIX,
                              REFINERY_W_VALUE_INPLACE);
             sdsfree(ns);
+            /* D17: the block keeps its class across the slot handoff. It may
+             * already have been promoted to HOT or WRITE, and a restamp to the
+             * declared class would have the collector copy it back next round. */
+            unsigned char hid = refinery_declared ? refinery_heap_id(&old->ptr) : 0;
             refinery_disown(&old->ptr);
             old->encoding = OBJ_ENCODING_RAW;
             old->ptr = NULL;
             val->ptr = NULL;
             refinery_install(&val->ptr, blk);
+            if (refinery_declared) refinery_set_heap_id(&val->ptr, hid);
             val->encoding = OBJ_ENCODING_RAW_GUIDED;
             refinery_mark_write(&val->ptr);
             return;
