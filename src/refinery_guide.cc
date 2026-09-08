@@ -68,8 +68,14 @@ static std::atomic<uint64_t> g_forks{0};
  * and the longest wait a fork that did proceed actually served out. */
 static std::atomic<uint64_t> g_fork_wait_timeouts{0};
 static std::atomic<uint64_t> g_fork_wait_ms_max{0};
-/* D17: blocks born directly in their declared destination class. */
-static std::atomic<uint64_t> g_stat_declared_births{0};
+/* D17: blocks born directly in their declared destination class. Counted here
+ * and not in the runtime's g_stat_declared_births (globalConfig.h, added by
+ * obase 588b284 for CrestKV) because the two count different birth sites:
+ * refinery_alloc() below is Redis's declared path, refineryNewAlloc() is
+ * ht_pugh's, and only the Redis one runs in this process. Distinct name --
+ * a static definition of the runtime's name would not compile against
+ * globalConfig.h. INFO still reports it as refinery_declared_births. */
+static std::atomic<uint64_t> g_redis_declared_births{0};
 /*
  * I2, measured over exactly the child's life rather than inferred from a flag.
  * The four placement counters are snapshotted at the instant
@@ -292,7 +298,7 @@ extern "C" void *refinery_alloc(size_t n)
             return nullptr;
         p = g_refinery_sama->malloc(n, MemType::DRAM);
         if (p)
-            g_stat_declared_births.fetch_add(1, std::memory_order_relaxed);
+            g_redis_declared_births.fetch_add(1, std::memory_order_relaxed);
     }
     else
     {
@@ -807,7 +813,7 @@ extern "C" size_t refinery_info(char *buf, size_t buflen)
              "refinery_declared_births:%llu\r\n"
              "refinery_declared_later_moved:%llu\r\n",
              refinery_declared,
-             (unsigned long long)g_stat_declared_births.load(),
+             (unsigned long long)g_redis_declared_births.load(),
              (unsigned long long)g_stat_moved_out_of_cold.load());
     out += line;
 
