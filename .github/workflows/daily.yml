@@ -891,7 +891,7 @@ jobs:
         repository: ${{ env.GITHUB_REPOSITORY }}
         ref: ${{ env.GITHUB_HEAD_REF }}
     - name: test
-      uses: cross-platform-actions/action@v0.30.0
+      uses: cross-platform-actions/action@v1.6.0
       env:
         MAKE: gmake
       with:
@@ -926,7 +926,7 @@ jobs:
         repository: ${{ env.GITHUB_REPOSITORY }}
         ref: ${{ env.GITHUB_HEAD_REF }}
     - name: test
-      uses: cross-platform-actions/action@v0.30.0
+      uses: cross-platform-actions/action@v1.6.0
       with:
         operating_system: freebsd
         version: 13.2
@@ -957,7 +957,7 @@ jobs:
         repository: ${{ env.GITHUB_REPOSITORY }}
         ref: ${{ env.GITHUB_HEAD_REF }}
     - name: test
-      uses: cross-platform-actions/action@v0.30.0
+      uses: cross-platform-actions/action@v1.6.0
       with:
         operating_system: freebsd
         version: 13.2
